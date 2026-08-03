@@ -344,6 +344,44 @@ test("chat.params: attaches Kimi fields for a model known only from server disco
   expect(output.options.thinking).toEqual({ type: "enabled" })
 })
 
+test("chat.params: max clamps to high for a discovered model outside the max-capable list", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  const { output } = await callParams(
+    hooks["chat.params"]!,
+    { modelID: "k4", modelOptions: { reasoning_effort: "max" } },
+    { reasoning_effort: "max" },
+  )
+  // Safe default until the model is verified max-capable: an unsupported
+  // effort value would fail the request upstream.
+  expect(output.options.reasoning_effort).toBe("high")
+  expect(output.options.thinking).toEqual({ type: "enabled" })
+})
+
+test("chat.params: a fallback-id model drops out of the gate once discovery succeeded without it", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  // Server says the account has only "k4" — a stale "kimi-for-coding-highspeed"
+  // config entry must no longer receive Kimi-specific request fields.
+  const { output } = await callParams(hooks["chat.params"]!, { modelID: "kimi-for-coding-highspeed" })
+  expect(output.options.prompt_cache_key).toBeUndefined()
+  expect(output.options.thinking).toBeUndefined()
+})
+
 // ---------- config hook (startup model sync) ---------------------------------
 
 test("config: injects server-discovered models into the provider config at startup", async () => {
@@ -428,19 +466,73 @@ test("config: user model overrides win over generated entries", async () => {
   })
 })
 
-test("config: never throws when not logged in and the network is down", async () => {
-  mock = installFetchMock(() => {
-    throw new Error("network down")
+test("config: never throws when the network is down with a stored token", async () => {
+  await withTempAuthStore(validAuth(), async () => {
+    mock = installFetchMock(() => {
+      throw new Error("network down")
+    })
+    const { hooks } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
+      "k3",
+      "kimi-for-coding",
+      "kimi-for-coding-highspeed",
+    ])
   })
-  const { hooks } = await getHooks()
-  const config: { provider?: Record<string, any> } = {}
-  await hooks.config!(config as any)
-  // No stored auth → static fallback list is injected.
-  expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
-    "k3",
-    "kimi-for-coding",
-    "kimi-for-coding-highspeed",
-  ])
+})
+
+test("config: refreshes an expiring stored token before startup discovery", async () => {
+  const expiring = validAuth({ access: "stale", expires: Date.now() + REFRESH_SAFETY_WINDOW_MS / 2 })
+  await withTempAuthStore(expiring, async () => {
+    mock = installFetchMock((call) => {
+      if (call.url.includes("/oauth/token")) {
+        return { body: { access_token: "fresh", refresh_token: "refresh-2", token_type: "Bearer", expires_in: 900 } }
+      }
+      if (call.url.endsWith("/coding/v1/models") && call.headers["authorization"] === "Bearer fresh") {
+        return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+      }
+      return { status: 401, body: { error: "unauthorized" } }
+    })
+    const { hooks, writes } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    // A ~15-min access token is almost always expired at startup; discovery
+    // must still succeed via the refresh path instead of degrading to the
+    // static fallback.
+    expect(mock.calls.map((c) => c.url)).toEqual([
+      "https://auth.kimi.com/api/oauth/token",
+      "https://api.kimi.com/coding/v1/models",
+    ])
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["k4"])
+    expect(writes.some((w) => (w.body as { access?: string }).access === "fresh")).toBe(true)
+  })
+})
+
+test("config: retries discovery once with a forced refresh on 401", async () => {
+  await withTempAuthStore(validAuth({ access: "stale" }), async () => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models") && call.headers["authorization"] === "Bearer stale") {
+        return { status: 401, body: { error: "unauthorized" } }
+      }
+      if (call.url.includes("/oauth/token")) {
+        return { body: { access_token: "fresh", refresh_token: "refresh-2", token_type: "Bearer", expires_in: 900 } }
+      }
+      if (call.url.endsWith("/coding/v1/models") && call.headers["authorization"] === "Bearer fresh") {
+        return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+      }
+      return { body: { ok: true } }
+    })
+    const { hooks } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    expect(mock.calls.map((c) => c.url)).toEqual([
+      "https://api.kimi.com/coding/v1/models",
+      "https://auth.kimi.com/api/oauth/token",
+      "https://api.kimi.com/coding/v1/models",
+    ])
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["k4"])
+  })
 })
 
 // ---------- auth.loader -----------------------------------------------------

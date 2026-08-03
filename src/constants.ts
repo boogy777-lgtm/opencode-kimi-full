@@ -32,8 +32,6 @@ export const MODEL_ID = "kimi-for-coding"
 // model list at all. The entries below are only the cold-start fallback used
 // when discovery has not produced a list yet in this process (offline start,
 // not logged in, or the chat hooks firing before the first discovery).
-export const FALLBACK_MODEL_IDS = ["k3", "kimi-for-coding", "kimi-for-coding-highspeed"] as const
-
 // Fallback per-model metadata for the same cold-start path. Server-reported
 // `display_name` / `context_length` / `supports_*` flags always win over these.
 export const FALLBACK_MODELS: ReadonlyArray<{
@@ -59,6 +57,9 @@ export const FALLBACK_MODELS: ReadonlyArray<{
     supports_video_in: false,
   },
 ]
+
+// Derived, never edited by hand — a separate literal would drift.
+export const FALLBACK_MODEL_IDS: readonly string[] = FALLBACK_MODELS.map((m) => m.id)
 
 // Last-resort context length when neither the server nor the fallback table
 // knows the model. Matches the K2.7 generation's window.

@@ -102,12 +102,14 @@ function isKimiModel(modelId: string, known: ReadonlySet<string>): boolean {
   return modelId === MODEL_ID || known.has(modelId)
 }
 
-// The known set is the server-discovered list plus the static cold-start
-// fallback. Once discovery succeeds in this process its ids are authoritative
-// (kimi-cli keeps no static list at all); the fallback only covers the window
-// before the first discovery.
+// The known set is the server-discovered list once discovery has succeeded in
+// this process (kimi-cli keeps no static list at all — removed/entitled-out
+// models drop out of the gate, so their requests fail loud server-side
+// instead of carrying Kimi-specific fields). The static fallback only covers
+// the window before the first discovery.
 function knownModelIds(discovery: ModelDiscovery): ReadonlySet<string> {
-  return new Set([...FALLBACK_MODEL_IDS, ...(discovery.models?.map((m) => m.id) ?? [])])
+  if (discovery.models?.length) return new Set(discovery.models.map((m) => m.id))
+  return new Set(FALLBACK_MODEL_IDS)
 }
 
 function supportsMaxReasoning(modelId: string): boolean {
@@ -528,7 +530,11 @@ const plugin: Plugin = async ({ client }) => {
   }
 
   const rememberDiscovery = (models: KimiModelInfo[]): ModelDiscovery => {
-    if (models.length) cachedDiscovery = { models }
+    // Always overwrite, even with an empty list: a successful `/models`
+    // response is authoritative (kimi-cli removes gone models), so stale
+    // entries must not survive it. Errors never reach this call — callers
+    // keep their previous cache on failure.
+    cachedDiscovery = { models }
     return cachedDiscovery
   }
 
@@ -576,10 +582,11 @@ const plugin: Plugin = async ({ client }) => {
      * Startup model sync, mirroring kimi-cli's `refresh_managed_models`
      * background task (research/kimi-cli/src/kimi_cli/app.py). Runs before
      * opencode reads `cfg.provider`, so the discovered models land in the
-     * provider's model picker without any manual config block. Best-effort:
-     * uses the stored token as-is (the loader owns refreshes), and falls back
-     * to the static model list when discovery is unavailable. Never throws —
-     * a failing network must not break opencode startup.
+     * provider's model picker without any manual config block. Kimi access
+     * tokens live ~15 min, so a cold start almost always holds an expired
+     * one — refresh it first (same lock/refresh path the loader uses), then
+     * discover; the static fallback is only for refresh-and-retry failure.
+     * Never throws — a failing network must not break opencode startup.
      */
     config: async (input) => {
       try {
@@ -587,11 +594,19 @@ const plugin: Plugin = async ({ client }) => {
         if (!models?.length) {
           const auth = await readLiveAuth()
           if (auth) {
-            try {
-              models = rememberDiscovery(await listModels(auth.access)).models
-            } catch {
-              models = undefined
-            }
+            models = await (async () => {
+              try {
+                const fresh = isAuthExpiring(auth) ? await refreshAuth(auth) : auth
+                try {
+                  return rememberDiscovery(await listModels(fresh.access)).models
+                } catch (error) {
+                  if ((error as { status?: number }).status !== 401) return undefined
+                  return rememberDiscovery(await listModels((await refreshAuth(fresh, true)).access)).models
+                }
+              } catch {
+                return undefined
+              }
+            })()
           }
         }
         upsertProviderConfig(input, models?.length ? models : FALLBACK_MODELS)
@@ -747,11 +762,16 @@ const plugin: Plugin = async ({ client }) => {
                   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
                     const requestedModelId = typeof parsed.model === "string" ? parsed.model : undefined
                     // Look up the discovered wire id for the requested model.
-                    // For the legacy MODEL_ID placeholder, fall back to the
-                    // first discovered model to preserve old behavior.
+                    // The legacy MODEL_ID placeholder falls back to the
+                    // discovered slug ONLY when discovery returned exactly one
+                    // model — that pick is unambiguous. With several models
+                    // (or none), guessing models[0] could silently run the
+                    // request on a different model than the user selected, so
+                    // we leave the id on the wire and let the server answer
+                    // with a visible entitlement error instead.
                     const discovered = requestedModelId
                       ? (auth.models?.find((m) => m.id === requestedModelId) ??
-                        (requestedModelId === MODEL_ID ? auth.models?.[0] : undefined))
+                        (requestedModelId === MODEL_ID && auth.models?.length === 1 ? auth.models[0] : undefined))
                       : undefined
                     const targetModel = discovered?.id
                     const changedBody =
