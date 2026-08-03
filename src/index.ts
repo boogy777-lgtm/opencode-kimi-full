@@ -1,7 +1,16 @@
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 import { isAuthExpiring, refreshAuthWithLock } from "./auth-refresh.ts"
 import { isOAuthAuth, readAuth, type OAuthAuth } from "./auth-store.ts"
-import { API_BASE_URL, MODEL_ID, PROVIDER_ID } from "./constants.ts"
+import {
+  API_BASE_URL,
+  DEFAULT_CONTEXT_LENGTH,
+  DEFAULT_OUTPUT_LIMIT,
+  FALLBACK_MODEL_IDS,
+  FALLBACK_MODELS,
+  MAX_REASONING_MODEL_IDS,
+  MODEL_ID,
+  PROVIDER_ID,
+} from "./constants.ts"
 import { kimiHeaders } from "./headers.ts"
 import { type KimiModelInfo, listModels, pollDeviceToken, startDeviceAuth } from "./oauth.ts"
 
@@ -15,6 +24,12 @@ import { type KimiModelInfo, listModels, pollDeviceToken, startDeviceAuth } from
 // Keep constants in constants.ts and import them here.
 
 type ModelDiscovery = {
+  models?: KimiModelInfo[]
+}
+
+// Per-model metadata extracted from the discovery response for the loader's
+// wire model rewriting and the printed config hint.
+type SingleModelDiscovery = {
   model_id?: string
   context_length?: number
   model_display?: string
@@ -83,17 +98,34 @@ function pickEffort(options: Record<string, unknown> | undefined) {
   return typeof effort === "string" ? effort : undefined
 }
 
-// kimi-cli clamps xhigh/max to "high" (research/kimi-cli/packages/kosong/
-// src/kosong/chat_provider/kimi.py, Kimi.with_thinking). Other providers
-// support higher tiers but Kimi's backend does not.
-function clampEffort(effort: string): string {
-  if (effort === "xhigh" || effort === "max") return "high"
+function isKimiModel(modelId: string, known: ReadonlySet<string>): boolean {
+  return modelId === MODEL_ID || known.has(modelId)
+}
+
+// The known set is the server-discovered list plus the static cold-start
+// fallback. Once discovery succeeds in this process its ids are authoritative
+// (kimi-cli keeps no static list at all); the fallback only covers the window
+// before the first discovery.
+function knownModelIds(discovery: ModelDiscovery): ReadonlySet<string> {
+  return new Set([...FALLBACK_MODEL_IDS, ...(discovery.models?.map((m) => m.id) ?? [])])
+}
+
+function supportsMaxReasoning(modelId: string): boolean {
+  return (MAX_REASONING_MODEL_IDS as readonly string[]).includes(modelId)
+}
+
+// kimi-cli clamps xhigh to "high" for all current Kimi Code models and also
+// clamps max to "high" for K2.7 models. K3 (model id "k3") keeps max as-is
+// because Kimi's backend supports it for the flagship model.
+function clampEffort(effort: string, modelId: string): string {
+  if (effort === "xhigh") return "high"
+  if (effort === "max" && !supportsMaxReasoning(modelId)) return "high"
   return effort
 }
 
-function resolveKimiBodyFields(input: KimiHookInput): KimiBodyFields | undefined {
+function resolveKimiBodyFields(input: KimiHookInput, known: ReadonlySet<string>): KimiBodyFields | undefined {
   if (input.model.providerID !== PROVIDER_ID) return
-  if (input.model.id !== MODEL_ID) return
+  if (!isKimiModel(input.model.id, known)) return
 
   const modelOptions = asRecord(input.model.options)
   const variantOptions = input.message.model.variant
@@ -103,7 +135,7 @@ function resolveKimiBodyFields(input: KimiHookInput): KimiBodyFields | undefined
   const fields: KimiBodyFields = { prompt_cache_key: input.sessionID }
   const thinking = asThinking(variantOptions?.thinking) ?? asThinking(modelOptions?.thinking)
   const rawEffort = pickEffort(variantOptions) ?? pickEffort(modelOptions)
-  const effort = rawEffort ? clampEffort(rawEffort) : undefined
+  const effort = rawEffort ? clampEffort(rawEffort, input.model.id) : undefined
 
   if (effort === "auto") return fields
   if (effort === "off") {
@@ -148,18 +180,6 @@ function consumeInternalKimiBodyFields(headers: Headers): KimiBodyFields {
 
 function hasKimiBodyFields(fields: KimiBodyFields) {
   return Boolean(fields.prompt_cache_key || fields.reasoning_effort || fields.thinking)
-}
-
-function pickModelInfo(models: KimiModelInfo[]): ModelDiscovery {
-  const picked = models.find((m) => m.id === MODEL_ID) ?? models[0]
-  if (!picked) return {}
-  return {
-    model_id: picked.id,
-    context_length: picked.context_length,
-    model_display: picked.display_name,
-    supports_image_in: picked.supports_image_in,
-    supports_video_in: picked.supports_video_in,
-  }
 }
 
 function withDiscoveredContext<T extends ModelWithDiscoveryMetadata>(model: T, contextLength: number | undefined): T {
@@ -268,57 +288,132 @@ function withDiscoveredMediaInput<T extends ModelWithDiscoveryMetadata>(
   }
 }
 
-function applyDiscoveryToModels<T extends Record<string, ModelWithDiscoveryMetadata>>(models: T, discovery: ModelDiscovery): T {
-  const current = models[MODEL_ID]
-  if (!current) return models
-  const next = withDiscoveredMediaInput(
-    withDiscoveredContext(withDiscoveredDisplayName(current, discovery.model_display), discovery.context_length),
-    discovery.supports_image_in,
-    discovery.supports_video_in,
-  )
-  if (next === current) return models
+function prettifyModelId(modelId: string): string {
+  return modelId
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => part[0]!.toUpperCase() + part.slice(1))
+    .join(" ")
+}
+
+// Server-reported context length wins; then the fallback table; then the
+// K2.7-generation default. Mirrors kimi-cli, which trusts `context_length`
+// from `/models` unconditionally.
+function contextLengthFor(model: { id: string; context_length?: number }): number {
+  if (model.context_length && model.context_length > 0) return model.context_length
+  return FALLBACK_MODELS.find((m) => m.id === model.id)?.context_length ?? DEFAULT_CONTEXT_LENGTH
+}
+
+function effortVariants(): Record<string, Record<string, unknown>> {
   return {
-    ...models,
-    [MODEL_ID]: next,
+    off: { reasoning_effort: "off" },
+    auto: { reasoning_effort: "auto" },
+    low: { reasoning_effort: "low" },
+    medium: { reasoning_effort: "medium" },
+    high: { reasoning_effort: "high" },
+    max: { reasoning_effort: "max" },
   }
 }
 
-function buildConfigBlock(info: { model_id: string; display?: string; supports_image_in?: boolean; supports_video_in?: boolean }) {
-  const name = info.display ?? "Kimi For Coding"
-  // The opencode-side model key is always MODEL_ID ("kimi-for-coding"); the
-  // plugin rewrites the wire `model` body field to `info.model_id` inside
-  // `loader.fetch`. This way users paste identical config even if the
-  // server reports a different wire slug for their account.
-  //
-  // Intentionally omit `limit`: opencode's config schema requires
-  // `limit.output` whenever a `limit` object is present, but Kimi's
-  // `/coding/v1/models` discovery only tells us `context_length`. The
-  // provider.models hook backfills `limit.context` at runtime.
+// Full runtime model entry for a server-discovered model that is missing from
+// the user's config. Shape mirrors what opencode core synthesizes for
+// dynamically discovered models (see the gitlab `discoverModels` loader in
+// research/opencode/packages/opencode/src/provider/provider.ts).
+function buildRuntimeModel(discovered: KimiModelInfo): Record<string, unknown> {
+  const supportsImageIn = discovered.supports_image_in ?? true
+  const supportsVideoIn = discovered.supports_video_in ?? false
+  return {
+    api: { id: discovered.id, url: API_BASE_URL, npm: "@ai-sdk/openai-compatible" },
+    name: discovered.display_name ?? prettifyModelId(discovered.id),
+    status: "active",
+    headers: {},
+    options: {},
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: contextLengthFor(discovered), output: DEFAULT_OUTPUT_LIMIT },
+    capabilities: {
+      temperature: false,
+      reasoning: true,
+      attachment: supportsImageIn,
+      toolcall: true,
+      input: { text: true, audio: false, image: supportsImageIn, video: supportsVideoIn, pdf: false },
+      output: { text: true, audio: false, image: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    release_date: "",
+    variants: effortVariants(),
+  }
+}
+
+function applyDiscoveryToModels<T extends Record<string, ModelWithDiscoveryMetadata>>(
+  models: T,
+  discovery: KimiModelInfo[],
+  known: ReadonlySet<string>,
+): T {
+  let changed = false
+  const nextModels = { ...models } as T
+  for (const [modelId, model] of Object.entries(models)) {
+    if (!isKimiModel(modelId, known)) continue
+    const discovered = discovery.find((m) => m.id === modelId)
+    if (!discovered) continue
+    const next = withDiscoveredMediaInput(
+      withDiscoveredContext(withDiscoveredDisplayName(model, discovered.display_name), discovered.context_length),
+      discovered.supports_image_in,
+      discovered.supports_video_in,
+    )
+    if (next === model) continue
+    ;(nextModels as Record<string, ModelWithDiscoveryMetadata>)[modelId] = next
+    changed = true
+  }
+  // kimi-cli's `_apply_models` materializes every server-returned model; do
+  // the same so newly released Kimi Code models appear without a config edit.
+  for (const discovered of discovery) {
+    if (nextModels[discovered.id]) continue
+    ;(nextModels as Record<string, unknown>)[discovered.id] = buildRuntimeModel(discovered)
+    changed = true
+  }
+  return changed ? nextModels : models
+}
+
+function buildModelConfig(
+  name: string,
+  contextLength: number,
+  supportsImageIn: boolean,
+  supportsVideoIn: boolean,
+): Record<string, unknown> {
   const modelConfig: Record<string, unknown> = {
     name,
     reasoning: true,
+    limit: { context: contextLength, output: DEFAULT_OUTPUT_LIMIT },
     options: {},
-    variants: {
-      off: { reasoning_effort: "off" },
-      auto: { reasoning_effort: "auto" },
-      low: { reasoning_effort: "low" },
-      medium: { reasoning_effort: "medium" },
-      high: { reasoning_effort: "high" },
-    },
+    variants: effortVariants(),
   }
-  if (info.supports_image_in) {
+  if (supportsImageIn) {
     // opencode's provider transform gates image parts on model metadata
     // before the request reaches our loader. Mirror Kimi's discovered
     // capability here so pasted images survive into the upstream SDK.
     modelConfig.attachment = true
     const inputModalities = ["text", "image"]
-    if (info.supports_video_in) inputModalities.push("video")
+    if (supportsVideoIn) inputModalities.push("video")
     modelConfig.modalities = {
       input: inputModalities,
       output: ["text"],
     }
   }
+  return modelConfig
+}
 
+function configModelEntry(model: { id: string; display_name?: string; context_length?: number; supports_image_in?: boolean; supports_video_in?: boolean }) {
+  // Fall back to image=true because all current Kimi Code models support
+  // image input; video only when the server explicitly says so.
+  return buildModelConfig(
+    model.display_name ?? prettifyModelId(model.id),
+    contextLengthFor(model),
+    model.supports_image_in ?? true,
+    model.supports_video_in ?? false,
+  )
+}
+
+function buildConfigBlock(models: KimiModelInfo[]) {
   return JSON.stringify(
     {
       provider: {
@@ -326,15 +421,55 @@ function buildConfigBlock(info: { model_id: string; display?: string; supports_i
           npm: "@ai-sdk/openai-compatible",
           name: "Kimi For Coding (OAuth)",
           options: { baseURL: API_BASE_URL },
-          models: {
-            [MODEL_ID]: modelConfig,
-          },
+          models: Object.fromEntries(models.map((model) => [model.id, configModelEntry(model)])),
         },
       },
     },
     null,
     2,
   )
+}
+
+type ConfigProviderEntry = {
+  npm?: string
+  name?: string
+  options?: Record<string, unknown>
+  models?: Record<string, Record<string, unknown>>
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+}
+
+// User config wins on conflicts; objects merge recursively so a user who
+// overrides only `variants.high` keeps the generated `limit`/`modalities`.
+function mergeModelConfig(generated: Record<string, unknown>, user: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...generated }
+  for (const [key, value] of Object.entries(user)) {
+    const base = out[key]
+    out[key] = isPlainObject(base) && isPlainObject(value) ? mergeModelConfig(base, value) : value
+  }
+  return out
+}
+
+// Inject the provider entry and its model list into opencode's config before
+// providers initialize (same mechanism opencode-qwencode-auth uses). Model
+// set is server-discovered when possible, the static fallback otherwise.
+// kimi-cli's `_apply_models` treats `/models` as the full truth — union
+// semantics here gives the same "new models appear at startup" behavior while
+// never deleting entries the user wrote themselves.
+function upsertProviderConfig(input: { provider?: Record<string, ConfigProviderEntry> }, models: ReadonlyArray<KimiModelInfo>) {
+  input.provider ??= {}
+  const provider = (input.provider[PROVIDER_ID] ??= {})
+  provider.npm ??= "@ai-sdk/openai-compatible"
+  provider.name ??= "Kimi For Coding (OAuth)"
+  provider.options = { baseURL: API_BASE_URL, ...provider.options }
+  provider.models ??= {}
+  for (const model of models) {
+    const generated = configModelEntry(model)
+    const existing = provider.models[model.id]
+    provider.models[model.id] = isPlainObject(existing) ? mergeModelConfig(generated, existing) : generated
+  }
 }
 
 /**
@@ -353,14 +488,21 @@ function buildConfigBlock(info: { model_id: string; display?: string; supports_i
  *                  (c) lazily discovers the current wire model id from
  *                  `GET /coding/v1/models`, and (d) retries once with a forced
  *                  refresh on 401.
- *   3. `provider.models` — discovers `context_length` / `display_name` early
- *                  enough to patch opencode's runtime model metadata when the
- *                  user's config still has the default placeholder values.
- *   4. `chat.headers` — computes the Kimi-specific request body fields the
+ *   3. `config`  — startup model sync: fetches `/coding/v1/models` with the
+ *                  stored token and injects the provider entry + full model
+ *                  list into opencode's config, so newly released Kimi Code
+ *                  models appear in the picker without a plugin update or a
+ *                  manual config block (mirrors kimi-cli's background
+ *                  `refresh_managed_models`).
+ *   4. `provider.models` — patches opencode's runtime model metadata
+ *                  (`context_length`, `display_name`, media capabilities)
+ *                  from the same discovery and materializes discovered models
+ *                  missing from the config.
+ *   5. `chat.headers` — computes the Kimi-specific request body fields the
  *                  model actually needs (`thinking.type`,
  *                  `reasoning_effort`, `prompt_cache_key`) and passes them to
  *                  `loader.fetch` via private headers.
- *   5. `chat.params` — mirrors the same fields into `output.options` for
+ *   6. `chat.params` — mirrors the same fields into `output.options` for
  *                  forward-compat if opencode fixes its current
  *                  openai-compatible providerOptions namespace mismatch.
  */
@@ -385,8 +527,8 @@ const plugin: Plugin = async ({ client }) => {
     syncProcessAuthContent(auth)
   }
 
-  const rememberDiscovery = (discovery: ModelDiscovery) => {
-    if (discovery.model_id) cachedDiscovery = discovery
+  const rememberDiscovery = (models: KimiModelInfo[]): ModelDiscovery => {
+    if (models.length) cachedDiscovery = { models }
     return cachedDiscovery
   }
 
@@ -430,13 +572,42 @@ const plugin: Plugin = async ({ client }) => {
   // --- return hooks ----------------------------------------------------------
 
   return {
+    /**
+     * Startup model sync, mirroring kimi-cli's `refresh_managed_models`
+     * background task (research/kimi-cli/src/kimi_cli/app.py). Runs before
+     * opencode reads `cfg.provider`, so the discovered models land in the
+     * provider's model picker without any manual config block. Best-effort:
+     * uses the stored token as-is (the loader owns refreshes), and falls back
+     * to the static model list when discovery is unavailable. Never throws —
+     * a failing network must not break opencode startup.
+     */
+    config: async (input) => {
+      try {
+        let models = cachedDiscovery.models
+        if (!models?.length) {
+          const auth = await readLiveAuth()
+          if (auth) {
+            try {
+              models = rememberDiscovery(await listModels(auth.access)).models
+            } catch {
+              models = undefined
+            }
+          }
+        }
+        upsertProviderConfig(input, models?.length ? models : FALLBACK_MODELS)
+      } catch {
+        /* startup must never fail because of model sync */
+      }
+    },
     provider: {
       id: PROVIDER_ID,
       models: async (provider, ctx) => {
         if (!isOAuthAuth(ctx.auth)) return provider.models
 
-        const discover = async (auth: OAuthAuth) =>
-          applyDiscoveryToModels(provider.models, rememberDiscovery(pickModelInfo(await listModels(auth.access))))
+        const discover = async (auth: OAuthAuth) => {
+          const models = rememberDiscovery(await listModels(auth.access)).models ?? []
+          return applyDiscoveryToModels(provider.models, models, knownModelIds(cachedDiscovery))
+        }
 
         const current = (await readCurrentAuth()) ?? ctx.auth
         let auth = current
@@ -477,20 +648,32 @@ const plugin: Plugin = async ({ client }) => {
           // (`refresh`/`access`/`expires`) on `client.auth.set`, so discovery
           // cannot live durably in auth.json across refresh writes. Cache it in
           // this loader instance instead, and repopulate lazily on startup.
-          discovery = rememberDiscovery(pickModelInfo(await listModels(access)))
+          discovery = rememberDiscovery(await listModels(access))
           return discovery
         }
 
-        const ensureDiscovered = async (auth: OAuthAuth & Partial<ModelDiscovery>) => {
-          if (!discovery.model_id && auth.model_id) {
-            discovery = {
-              model_id: auth.model_id,
-              context_length: auth.context_length,
-              model_display: auth.model_display,
+        const ensureDiscovered = async (auth: OAuthAuth & Partial<ModelDiscovery> & Partial<SingleModelDiscovery>) => {
+          if (!discovery.models?.length) {
+            if (auth.models?.length) {
+              discovery = { models: auth.models }
+            } else if (auth.model_id) {
+              // Backward compatibility: in-memory auth snapshots may carry a
+              // single discovered model_id from older plugin versions/tests.
+              discovery = {
+                models: [
+                  {
+                    id: auth.model_id,
+                    display_name: auth.model_display,
+                    context_length: auth.context_length,
+                    supports_image_in: auth.supports_image_in,
+                    supports_video_in: auth.supports_video_in,
+                  } as KimiModelInfo,
+                ],
+              }
             }
-            cachedDiscovery = discovery
+            if (discovery.models?.length) cachedDiscovery = discovery
           }
-          if (discovery.model_id) return { ...auth, ...discovery }
+          if (discovery.models?.length) return { ...auth, ...discovery }
           try {
             return { ...auth, ...(await discoverModelInfo(auth.access)) }
           } catch {
@@ -498,8 +681,8 @@ const plugin: Plugin = async ({ client }) => {
           }
         }
 
-        const ensureFresh = async (force = false): Promise<OAuthAuth & ModelDiscovery> => {
-          const current = (await readCurrentAuth(readAuth)) as (OAuthAuth & Partial<ModelDiscovery>) | undefined
+        const ensureFresh = async (force = false): Promise<OAuthAuth & ModelDiscovery & Partial<SingleModelDiscovery>> => {
+          const current = (await readCurrentAuth(readAuth)) as (OAuthAuth & Partial<ModelDiscovery> & Partial<SingleModelDiscovery>) | undefined
           if (!current || current.type !== "oauth")
             throw new Error(
               "kimi-for-coding-oauth: not logged in — run `opencode auth login kimi-for-coding-oauth`",
@@ -509,9 +692,9 @@ const plugin: Plugin = async ({ client }) => {
           // kimi-cli re-runs `refresh_managed_models` on every successful
           // refresh — we mirror that so entitlement or display-name changes
           // are picked up without a full re-login. Failures here must not
-          // block the refresh: a
-          // warm in-memory discovery still works for the common case, and
-          // the request-path 401 retry will flush a broken access token.
+          // block the refresh: a warm in-memory discovery still works for the
+          // common case, and the request-path 401 retry will flush a broken
+          // access token.
           try {
             await discoverModelInfo(next.access)
           } catch {
@@ -542,22 +725,13 @@ const plugin: Plugin = async ({ client }) => {
               for (const [k, v] of Object.entries(kimiHeaders())) headers.set(k, v)
               headers.set("Authorization", `Bearer ${auth.access}`)
 
-              // Rewrite the wire `model` to the server-discovered id.
-              // opencode bakes the model id into the LanguageModel instance
-              // at provider-init time (via `provider.chatModel(modelId)`),
-              // so `chat.params` cannot change it. We rewrite the JSON
-              // body here instead. Only touches requests where:
-              //   - we have a discovered id that differs from what opencode
-              //     sent (otherwise leave the body untouched),
-              //   - the body is JSON with a string `model` field equal to
-              //     our opencode-side placeholder MODEL_ID.
-              // This way `input.model.id` stays `kimi-for-coding` in
-              // opencode's UI/config, while Moonshot sees whatever its
-              // /models endpoint says for this account (for example a
-              // non-default slug). Mirrors kimi-cli's behavior — it always sends
-              // exactly the id it got back from `/models`.
+              // Rewrite the wire `model` to the server-discovered id when it
+              // differs from what opencode sent. opencode bakes the model id
+              // into the LanguageModel instance at provider-init time, so
+              // `chat.params` cannot change it. We rewrite the JSON body here
+              // instead. Mirrors kimi-cli's behavior — it sends the id it got
+              // back from `/models`.
               let newInit = init
-              const targetModel = auth.model_id
               const originalBody =
                 typeof init?.body === "string"
                   ? init.body
@@ -567,17 +741,30 @@ const plugin: Plugin = async ({ client }) => {
                         .text()
                         .catch(() => undefined)
                     : undefined
-              if (((targetModel && targetModel !== MODEL_ID) || hasKimiBodyFields(kimiBodyFields)) && originalBody) {
+              if (originalBody) {
                 try {
                   const parsed = JSON.parse(originalBody)
                   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                    if (targetModel && targetModel !== MODEL_ID && parsed.model === MODEL_ID) {
+                    const requestedModelId = typeof parsed.model === "string" ? parsed.model : undefined
+                    // Look up the discovered wire id for the requested model.
+                    // For the legacy MODEL_ID placeholder, fall back to the
+                    // first discovered model to preserve old behavior.
+                    const discovered = requestedModelId
+                      ? (auth.models?.find((m) => m.id === requestedModelId) ??
+                        (requestedModelId === MODEL_ID ? auth.models?.[0] : undefined))
+                      : undefined
+                    const targetModel = discovered?.id
+                    const changedBody =
+                      (targetModel && targetModel !== requestedModelId) || hasKimiBodyFields(kimiBodyFields)
+                    if (targetModel && targetModel !== requestedModelId) {
                       parsed.model = targetModel
                     }
                     if (hasKimiBodyFields(kimiBodyFields)) {
                       applyKimiBodyFields(parsed as Record<string, unknown>, kimiBodyFields)
                     }
-                    newInit = { ...init, body: JSON.stringify(parsed) }
+                    if (changedBody) {
+                      newInit = { ...init, body: JSON.stringify(parsed) }
+                    }
                   }
                 } catch {
                   /* non-JSON body, e.g. multipart — leave alone */
@@ -621,20 +808,15 @@ const plugin: Plugin = async ({ client }) => {
                   // the loader will re-attempt discovery before the first
                   // model-rewrite that needs it.
                   try {
-                    const discovered = pickModelInfo(await listModels(tokens.access_token))
-                    if (discovered.model_id) {
-                      // Print a ready-to-paste config block. opencode shows
-                      // this next to the "Authorized" message.
-                      const block = buildConfigBlock({
-                        model_id: discovered.model_id,
-                        display: discovered.model_display,
-                        supports_image_in: discovered.supports_image_in,
-                        supports_video_in: discovered.supports_video_in,
-                      })
+                    const models = rememberDiscovery(await listModels(tokens.access_token)).models ?? []
+                    if (models.length) {
+                      // Print the discovered model set. opencode shows this
+                      // next to the "Authorized" message.
+                      const block = buildConfigBlock(models)
                       console.log(
-                        `\n✓ Authorized for Kimi For Coding (model: ${discovered.model_id}${
-                          discovered.context_length ? `, context ${discovered.context_length}` : ""
-                        })\n\nAdd this to your opencode config (~/.config/opencode/opencode.json) if you haven't already:\n\n${block}\n`,
+                        `\n✓ Authorized for Kimi For Coding (models: ${models.map((m) => m.id).join(", ")})\n\n` +
+                          `The plugin injects these models into your opencode config automatically at startup — no manual provider block needed.\n\n` +
+                          `If you prefer pinning the config yourself (~/.config/opencode/opencode.json):\n\n${block}\n`,
                       )
                     }
                   } catch {
@@ -657,7 +839,7 @@ const plugin: Plugin = async ({ client }) => {
     },
 
     "chat.headers": async (input, output) => {
-      const fields = resolveKimiBodyFields(input as KimiHookInput)
+      const fields = resolveKimiBodyFields(input as KimiHookInput, knownModelIds(cachedDiscovery))
       if (!fields) return
       if (fields.prompt_cache_key) {
         output.headers[INTERNAL_PROMPT_CACHE_KEY_HEADER] = fields.prompt_cache_key
@@ -679,7 +861,7 @@ const plugin: Plugin = async ({ client }) => {
      * working if upstream aligns those keys later.
      */
     "chat.params": async (input, output) => {
-      const fields = resolveKimiBodyFields(input as KimiHookInput)
+      const fields = resolveKimiBodyFields(input as KimiHookInput, knownModelIds(cachedDiscovery))
       if (!fields) return
       applyKimiBodyFields(output.options, fields)
     },

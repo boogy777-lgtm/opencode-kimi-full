@@ -8,7 +8,8 @@ Compared with stock opencode Kimi setups, this plugin:
 - talks to `https://api.kimi.com/coding/v1` through `@ai-sdk/openai-compatible`
 - sends the same `User-Agent` / `X-Msh-*` fingerprint headers as `kimi-cli`
 - reuses `~/.kimi/device_id` for `X-Msh-Device-Id`
-- adds `prompt_cache_key`, `thinking`, and `reasoning_effort` for `kimi-for-coding` requests
+- adds `prompt_cache_key`, `thinking`, and `reasoning_effort` for Kimi Code requests
+- syncs the full model list from `/coding/v1/models` at every startup, so newly released Kimi Code models appear in the picker without a plugin update or config edits
 - discovers the authoritative wire model slug, display name, context length, and media-input capabilities from `/coding/v1/models`
 - keeps tokens in opencode's auth store while mirroring `kimi-cli`'s refresh / retry behavior
 - provides a `/kimi:usage` TUI command to check subscription usage
@@ -22,8 +23,7 @@ Contributor and agent documentation lives in [`AGENTS.md`](./AGENTS.md).
 1. Install the plugin globally: `opencode plugin opencode-kimi-full --global`
 2. If you are testing a local checkout instead of the published package, install the checkout path instead: `opencode plugin /absolute/path/to/opencode-kimi-full --global`
 3. Run `opencode auth login -p kimi-for-coding-oauth` and approve the device flow in your browser.
-4. Paste the provider block from [Configure](#configure) into your opencode config.
-5. Select `kimi-for-coding-oauth/kimi-for-coding` in opencode.
+4. Select any model under `kimi-for-coding-oauth/` in opencode. The provider entry and its model list are injected automatically at startup — no manual config block is required. See [Configure](#configure) only if you want to override something.
 
 ### Requirements
 
@@ -70,34 +70,26 @@ If you use a project-local `.opencode/opencode.json`, the plugin only exists whe
 
 ### Configure
 
-After the plugin is installed and login works, paste this provider entry into `~/.config/opencode/opencode.json` or `.opencode/opencode.json`:
+You normally don't need this section. At every startup the plugin:
+
+1. reads the stored OAuth token,
+2. queries `/coding/v1/models` for the authoritative model list of your account,
+3. injects the `kimi-for-coding-oauth` provider entry and one config entry per discovered model into opencode's runtime config (merging with — never overwriting — anything you wrote yourself).
+
+If the discovery call fails (offline start, expired token before the first refresh), a static fallback list (`k3`, `kimi-for-coding`, `kimi-for-coding-highspeed`) is injected instead so the plugin keeps working. kimi-cli manages its model list the same way: the server response is the only truth.
+
+Add a config block only to **override** generated entries. Your keys win per-field; everything else stays generated. Example — rename a model and pin a custom variant:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
     "kimi-for-coding-oauth": {
-      "name": "Kimi For Coding (OAuth)",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "https://api.kimi.com/coding/v1"
-      },
       "models": {
-        "kimi-for-coding": {
-          "name": "Kimi For Coding",
-          "attachment": true,
-          "reasoning": true,
-          "modalities": {
-            "input": ["text", "image"],
-            "output": ["text"]
-          },
-          "options": {},
+        "k3": {
+          "name": "Kimi K3 (mine)",
           "variants": {
-            "off":    { "reasoning_effort": "off" },
-            "auto":   { "reasoning_effort": "auto" },
-            "low":    { "reasoning_effort": "low" },
-            "medium": { "reasoning_effort": "medium" },
-            "high":   { "reasoning_effort": "high" }
+            "max": { "reasoning_effort": "max" }
           }
         }
       }
@@ -106,14 +98,35 @@ After the plugin is installed and login works, paste this provider entry into `~
 }
 ```
 
-> **Important:** The `attachment` and `modalities` fields are required for image input to work. Without them, opencode strips image parts before they reach Kimi. If you previously pasted an older config block without these fields, update it.
+Generated model entries look like this (shown for reference; `context` comes from the server, `output` is a conservative `65536`):
 
-This block is for using the model after login. It does **not** register the auth provider by itself. What makes `opencode auth login -p kimi-for-coding-oauth` work is the plugin being loaded via `opencode plugin ...` or the `plugin` array above.
+```json
+{
+  "k3": {
+    "name": "Kimi K3",
+    "attachment": true,
+    "reasoning": true,
+    "limit": { "context": 1048576, "output": 65536 },
+    "modalities": {
+      "input": ["text", "image"],
+      "output": ["text"]
+    },
+    "options": {},
+    "variants": {
+      "off":    { "reasoning_effort": "off" },
+      "auto":   { "reasoning_effort": "auto" },
+      "low":    { "reasoning_effort": "low" },
+      "medium": { "reasoning_effort": "medium" },
+      "high":   { "reasoning_effort": "high" },
+      "max":    { "reasoning_effort": "max" }
+    }
+  }
+}
+```
 
-Use these two ids exactly as written:
+> **Important:** The generated `attachment` and `modalities` fields are what make image input work — opencode strips image parts before they reach Kimi without them. The plugin injects them from the server's `supports_image_in` / `supports_video_in` flags; if you fully replace a model entry in your own config, keep those fields.
 
-- **provider id** `kimi-for-coding-oauth` -- the plugin's `auth` and `chat.params` hooks match on it.
-- **model id** `kimi-for-coding` -- a stable opencode-side alias. At login and on every token refresh the plugin queries `/coding/v1/models` and rewrites the wire `model` field if the server reports a different slug for your account.
+The **provider id** `kimi-for-coding-oauth` is fixed -- the plugin's `auth` and chat hooks match on it. **Model ids** come from `/coding/v1/models` (`k3`, `kimi-for-coding`, `kimi-for-coding-highspeed` as of writing); the plugin rewrites the wire `model` field to the server-reported slug on every request, and new ids the server starts returning show up in the picker after the next restart.
 
 > **Note.** The provider id is intentionally not `kimi-for-coding`. That id is already published by [models.dev](https://models.dev) and points at a static-API-key flow using a different SDK and auth shape. Using a distinct id keeps the two paths from colliding under a single `opencode auth login` entry.
 
@@ -129,8 +142,8 @@ During login the plugin:
 
 - shows a verification URL and user code
 - stores the OAuth token in opencode's auth store
-- discovers the exact model slug, display name, context length, and media-input capabilities your account should send to Kimi
-- prints a config hint that uses the discovered display name and capabilities
+- discovers the exact model slugs, display names, context lengths, and media-input capabilities your account is entitled to
+- prints the discovered model list; the models themselves are injected into the config automatically at the next startup
 
 Access tokens refresh automatically while you use the model.
 
@@ -157,9 +170,9 @@ Fastest fix:
 <details>
 <summary><strong>Troubleshooting: Images not working / "this model does not support image input"</strong></summary>
 
-opencode gates image input on model metadata. If your config block is missing `attachment: true` and `modalities`, opencode strips image parts before they reach Kimi.
+opencode gates image input on model metadata. If a model entry is missing `attachment: true` and `modalities`, opencode strips image parts before they reach Kimi.
 
-Fix: update your config block to match the one in [Configure](#configure) above -- specifically add `"attachment": true` and `"modalities": { "input": ["text", "image"], "output": ["text"] }` to the model entry.
+The plugin generates these fields for every model it injects (from the server's `supports_image_in` / `supports_video_in` flags), so this should not happen with auto-injected entries. If you replaced a model entry in your own config block, add `"attachment": true` and `"modalities": { "input": ["text", "image"], "output": ["text"] }` to it.
 
 The plugin also backfills these capabilities at runtime from `/coding/v1/models` discovery, but the static config must be correct for the initial request.
 
@@ -168,10 +181,10 @@ The plugin also backfills these capabilities at runtime from `/coding/v1/models`
 <details>
 <summary><strong>Login and refresh details</strong></summary>
 
-- The plugin queries `/coding/v1/models` during login so it can discover the current wire model id, context length, and media capabilities for your account.
-- The plugin uses that discovery response to backfill image and video input support into opencode's runtime model metadata, so pasted or dropped images reach Kimi instead of being downgraded into local error text.
-- The printed config hint intentionally omits `limit`, because opencode requires both `limit.context` and `limit.output`, while Kimi's models endpoint only exposes `context_length`.
-- Model discovery runs again on every token refresh, and a fresh loader instance can re-query `/coding/v1/models` on first use if it needs the current wire model id.
+- The plugin queries `/coding/v1/models` at startup, during login, and on every token refresh so it always works with the account's current model entitlement: wire model ids, context lengths, and media capabilities.
+- The startup response feeds the config injection described in [Configure](#configure) — this is how newly released Kimi Code models appear in the picker without a plugin update.
+- The plugin uses the same discovery response to backfill image and video input support into opencode's runtime model metadata, so pasted or dropped images reach Kimi instead of being downgraded into local error text.
+- Generated config entries carry `limit.context` from the server-reported `context_length` (static doc values are only a fallback) and a conservative `output` limit of `65536`.
 - On a `401`, the loader refreshes the access token once and retries the request once.
 - Refreshes are coordinated through opencode's live auth store so concurrent workspaces do not keep using an older refresh-token chain from a stale `OPENCODE_AUTH_CONTENT` snapshot.
 
@@ -179,23 +192,23 @@ The plugin also backfills these capabilities at runtime from `/coding/v1/models`
 
 ### Use
 
-Select `kimi-for-coding-oauth/kimi-for-coding` in opencode.
+Select any model under `kimi-for-coding-oauth/` in opencode (`k3`, `kimi-for-coding`, `kimi-for-coding-highspeed`, or whatever the server currently returns for your account).
 
 The default variant-cycle keybind is **Ctrl+T**. The variants map as follows:
 
 - `off` -- sends `thinking: { "type": "disabled" }`
 - `auto` -- omits both `thinking` and `reasoning_effort`
-- `low` / `medium` / `high` -- send `thinking: { "type": "enabled" }` plus the matching `reasoning_effort`
+- `low` / `medium` / `high` / `max` -- send `thinking: { "type": "enabled" }` plus the matching `reasoning_effort`
 
 These variants only affect Kimi's reasoning request fields. They do not switch models or auth paths. In practice:
 
 - `off` asks the backend to disable thinking
 - `auto` leaves the decision to the server
 - `low` / `medium` / `high` ask for enabled thinking with the corresponding reasoning effort
+- `max` asks for the highest reasoning effort. For `k3` it is sent as `max`; for `kimi-for-coding` and `kimi-for-coding-highspeed` it is clamped to `high` to match kimi-cli behavior.
+- `xhigh` is clamped to `high` for all models.
 
-Effort levels `xhigh` and `max` are clamped to `high`, matching kimi-cli's behavior (Kimi's backend does not support higher tiers).
-
-Every `kimi-for-coding` request also gets `prompt_cache_key` set to opencode's session id. That mirrors `kimi-cli`'s cache hint so follow-up turns in the same session can reuse Kimi's prompt cache.
+Every Kimi Code request also gets `prompt_cache_key` set to opencode's session id. That mirrors `kimi-cli`'s cache hint so follow-up turns in the same session can reuse Kimi's prompt cache.
 
 #### Usage command
 
@@ -217,6 +230,7 @@ Stock opencode can already talk to generic Moonshot and OpenAI-compatible endpoi
 - The seven `X-Msh-*` headers and a kimi-cli-shaped `User-Agent`.
 - `~/.kimi/device_id` shared with a locally-installed kimi-cli.
 - Runtime model discovery from `/coding/v1/models`, including the server-reported wire slug, `display_name`, `context_length`, and media-input capabilities.
+- Startup model sync that injects the provider entry and the discovered model list into opencode's config, so new Kimi Code models appear without a plugin update.
 - Tokens stored in opencode's auth store under a dedicated provider id, so the plugin and kimi-cli keep independent refresh-token chains and do not invalidate each other.
 - Live auth-store rereads plus a provider-scoped refresh lock, so concurrent opencode workspaces converge on the latest refresh-token chain instead of tripping `invalid_grant`.
 - Streaming, `reasoning_content` deltas, and tool-call schemas are handled upstream by `@ai-sdk/openai-compatible` -- not reimplemented here.
@@ -229,19 +243,21 @@ Stock opencode can already talk to generic Moonshot and OpenAI-compatible endpoi
 | Field | Wire shape | Purpose |
 |---|---|---|
 | `prompt_cache_key` | top-level body, snake_case, set to opencode's `sessionID` | Opt-in, session-scoped cache key, mirroring kimi-cli. |
-| `thinking` + `reasoning_effort` | `thinking: { type: "enabled" \| "disabled" }` with sibling `reasoning_effort: "low" \| "medium" \| "high"` | Sent together, matching kimi-cli. `xhigh`/`max` clamped to `high`. |
+| `thinking` + `reasoning_effort` | `thinking: { type: "enabled" \| "disabled" }` with sibling `reasoning_effort: "low" \| "medium" \| "high" \| "max"` | Sent together, matching kimi-cli. `max` kept for `k3`, clamped to `high` for K2.7 models; `xhigh` clamped to `high`. |
 | Seven `X-Msh-*` headers + UA | `User-Agent`, `X-Msh-Platform`, `X-Msh-Version`, `X-Msh-Device-Name`, `X-Msh-Device-Model`, `X-Msh-Device-Id`, `X-Msh-Os-Version` | Matches kimi-cli's `_common_headers()` at the pinned `KIMI_CLI_VERSION`. |
 | `/coding/v1/models` discovery | `id`, `display_name`, `context_length`, `supports_image_in`, `supports_video_in` | Supplies the authoritative wire model slug plus runtime model metadata. |
 | `~/.kimi/device_id` | UUID persisted on disk, embedded in `X-Msh-Device-Id` | Sends the same `X-Msh-Device-Id` as a locally-installed kimi-cli. |
 
 Effort-to-field mapping used by the plugin:
 
-| user effort | `reasoning_effort` | `thinking` |
-|---|---|---|
-| `auto` | *(omitted)* | *(omitted)* -- server picks dynamically |
-| `off` | *(omitted)* | `{ type: "disabled" }` |
-| `low` / `medium` / `high` | same string | `{ type: "enabled" }` |
-| `xhigh` / `max` | `"high"` (clamped) | `{ type: "enabled" }` |
+| user effort | `reasoning_effort` | `thinking` | model |
+|---|---|---|---|
+| `auto` | *(omitted)* | *(omitted)* -- server picks dynamically | any |
+| `off` | *(omitted)* | `{ type: "disabled" }` | any |
+| `low` / `medium` / `high` | same string | `{ type: "enabled" }` | any |
+| `max` | `max` | `{ type: "enabled" }` | `k3` |
+| `max` | `"high"` (clamped) | `{ type: "enabled" }` | `kimi-for-coding`, `kimi-for-coding-highspeed` |
+| `xhigh` | `"high"` (clamped) | `{ type: "enabled" }` | any |
 
 </details>
 
@@ -263,6 +279,9 @@ No other state is persisted. Credentials are never written to `~/.kimi/credentia
 ```
                       opencode core
  ──────────────────────────────────────────────────
+  startup ─────> plugin "config"             /models discovery →
+                                               inject provider + model list
+
   auth.login ──> plugin.auth.authorize()     device-code flow, poll
                    └──> oauth.ts
 

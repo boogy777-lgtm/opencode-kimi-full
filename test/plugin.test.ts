@@ -224,6 +224,39 @@ test("chat.params: `reasoningEffort` (camelCase) input also drives the mapping",
   expect(output.options.reasoningEffort).toBeUndefined()
 })
 
+test("chat.params: k3 keeps max reasoning effort unclamped", async () => {
+  const { hooks } = await getHooks()
+  const { output } = await callParams(
+    hooks["chat.params"]!,
+    { modelID: "k3", modelOptions: { reasoning_effort: "max" } },
+    { reasoning_effort: "max" },
+  )
+  expect(output.options.reasoning_effort).toBe("max")
+  expect(output.options.thinking).toEqual({ type: "enabled" })
+})
+
+test("chat.params: k3 clamps xhigh to high", async () => {
+  const { hooks } = await getHooks()
+  const { output } = await callParams(
+    hooks["chat.params"]!,
+    { modelID: "k3", modelOptions: { reasoning_effort: "xhigh" } },
+    { reasoning_effort: "xhigh" },
+  )
+  expect(output.options.reasoning_effort).toBe("high")
+  expect(output.options.thinking).toEqual({ type: "enabled" })
+})
+
+test("chat.params: max clamped to high for kimi-for-coding", async () => {
+  const { hooks } = await getHooks()
+  const { output } = await callParams(
+    hooks["chat.params"]!,
+    { modelID: "kimi-for-coding", modelOptions: { reasoning_effort: "max" } },
+    { reasoning_effort: "max" },
+  )
+  expect(output.options.reasoning_effort).toBe("high")
+  expect(output.options.thinking).toEqual({ type: "enabled" })
+})
+
 test("chat.headers: default request enables thinking and carries prompt_cache_key", async () => {
   const { hooks } = await getHooks()
   const { output } = await callHeaders(hooks["chat.headers"]!)
@@ -257,6 +290,157 @@ test("chat.headers: effort=auto omits both thinking and reasoning_effort", async
   expect(output.headers[INTERNAL_PROMPT_CACHE_KEY_HEADER]).toBe("sess-1")
   expect(output.headers[INTERNAL_THINKING_TYPE_HEADER]).toBeUndefined()
   expect(output.headers[INTERNAL_REASONING_EFFORT_HEADER]).toBeUndefined()
+})
+
+test("provider.models: materializes a discovered model that is missing from the config", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [
+            { id: MODEL_ID, context_length: 262144 },
+            { id: "k4", display_name: "Kimi K4", context_length: 2097152, supports_image_in: true, supports_video_in: true },
+          ],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  const k4 = next["k4"] as any
+  expect(k4.name).toBe("Kimi K4")
+  expect(k4.status).toBe("active")
+  expect(k4.api).toEqual({ id: "k4", url: "https://api.kimi.com/coding/v1", npm: "@ai-sdk/openai-compatible" })
+  expect(k4.limit).toEqual({ context: 2097152, output: 65536 })
+  expect(k4.capabilities.reasoning).toBe(true)
+  expect(k4.capabilities.input.image).toBe(true)
+  expect(k4.capabilities.input.video).toBe(true)
+  expect(k4.variants.max).toEqual({ reasoning_effort: "max" })
+  // The caller's model map is never mutated.
+  expect((provider.models as Record<string, unknown>)["k4"]).toBeUndefined()
+})
+
+test("chat.params: attaches Kimi fields for a model known only from server discovery", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  // provider.models warms the plugin's discovery cache; the chat hooks gate
+  // on that known-model set, not on a hardcoded list.
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  const { output } = await callParams(
+    hooks["chat.params"]!,
+    { modelID: "k4", modelOptions: { reasoning_effort: "high" } },
+    { reasoning_effort: "high" },
+  )
+  expect(output.options.prompt_cache_key).toBe("sess-1")
+  expect(output.options.reasoning_effort).toBe("high")
+  expect(output.options.thinking).toEqual({ type: "enabled" })
+})
+
+// ---------- config hook (startup model sync) ---------------------------------
+
+test("config: injects server-discovered models into the provider config at startup", async () => {
+  await withTempAuthStore(validAuth(), async () => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) {
+        return {
+          body: {
+            data: [
+              { id: "k3", display_name: "Kimi K3", context_length: 1048576, supports_image_in: true },
+              { id: "k4", display_name: "Kimi K4", context_length: 2097152, supports_image_in: true, supports_video_in: true },
+            ],
+          },
+        }
+      }
+      return { body: { ok: true } }
+    })
+    const { hooks } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    const provider = config.provider![PROVIDER_ID]!
+    expect(provider.npm).toBe("@ai-sdk/openai-compatible")
+    expect(provider.name).toBe("Kimi For Coding (OAuth)")
+    expect(provider.options.baseURL).toBe("https://api.kimi.com/coding/v1")
+    expect(Object.keys(provider.models)).toEqual(["k3", "k4"])
+    const k4 = provider.models["k4"]
+    expect(k4.name).toBe("Kimi K4")
+    expect(k4.reasoning).toBe(true)
+    expect(k4.limit).toEqual({ context: 2097152, output: 65536 })
+    expect(k4.modalities).toEqual({ input: ["text", "image", "video"], output: ["text"] })
+    expect(k4.variants.max).toEqual({ reasoning_effort: "max" })
+  })
+})
+
+test("config: falls back to the static model list when discovery fails", async () => {
+  await withTempAuthStore(validAuth(), async () => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) return { status: 500, body: { error: "oops" } }
+      return { body: { ok: true } }
+    })
+    const { hooks } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
+      "k3",
+      "kimi-for-coding",
+      "kimi-for-coding-highspeed",
+    ])
+  })
+})
+
+test("config: user model overrides win over generated entries", async () => {
+  await withTempAuthStore(validAuth(), async () => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) {
+        return { body: { data: [{ id: "k3", display_name: "Kimi K3", context_length: 1048576, supports_image_in: true }] } }
+      }
+      return { body: { ok: true } }
+    })
+    const { hooks } = await getHooks()
+    const config = {
+      provider: {
+        [PROVIDER_ID]: {
+          models: {
+            k3: {
+              name: "My K3",
+              limit: { context: 999_999 },
+              variants: { high: { reasoning_effort: "high", temperature: 0.2 } },
+            },
+          },
+        },
+      },
+    }
+    await hooks.config!(config as any)
+    const k3 = (config.provider as any)[PROVIDER_ID].models.k3
+    expect(k3.name).toBe("My K3")
+    // Scalar user values win; untouched generated keys are preserved.
+    expect(k3.limit).toEqual({ context: 999_999, output: 65536 })
+    expect(k3.variants.high).toEqual({ reasoning_effort: "high", temperature: 0.2 })
+    expect(k3.variants.max).toEqual({ reasoning_effort: "max" })
+    expect(k3.modalities).toEqual({ input: ["text", "image"], output: ["text"] })
+  })
+})
+
+test("config: never throws when not logged in and the network is down", async () => {
+  mock = installFetchMock(() => {
+    throw new Error("network down")
+  })
+  const { hooks } = await getHooks()
+  const config: { provider?: Record<string, any> } = {}
+  await hooks.config!(config as any)
+  // No stored auth → static fallback list is injected.
+  expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
+    "k3",
+    "kimi-for-coding",
+    "kimi-for-coding-highspeed",
+  ])
 })
 
 // ---------- auth.loader -----------------------------------------------------
@@ -1073,9 +1257,10 @@ test("auth callback prints a schema-valid config snippet with top-level model va
     }
   }
   const model = parsed.provider[PROVIDER_ID]!.models[MODEL_ID]!
-  expect(text).toContain("context 262144")
+  expect(text).toContain("models: kimi-for-coding")
   expect(model.attachment).toBe(true)
-  expect(model.limit).toBeUndefined()
+  // The discovered context_length wins over the static doc fallback.
+  expect(model.limit).toEqual({ context: 262144, output: 65_536 })
   expect(model.modalities).toEqual({
     input: ["text", "image"],
     output: ["text"],
@@ -1083,5 +1268,6 @@ test("auth callback prints a schema-valid config snippet with top-level model va
   expect(model.options).toEqual({})
   expect(model.variants?.off).toEqual({ reasoning_effort: "off" })
   expect(model.variants?.auto).toEqual({ reasoning_effort: "auto" })
+  expect(model.variants?.max).toEqual({ reasoning_effort: "max" })
   expect(model.options?.variants).toBeUndefined()
 })
