@@ -25,44 +25,14 @@ export const API_BASE_URL = "https://api.kimi.com/coding/v1"
 // Stable opencode-side alias kept for backward compatibility.
 export const MODEL_ID = "kimi-for-coding"
 
-// The authoritative model list is the server's `GET /coding/v1/models`
-// response, discovered at startup (config hook), at login, and on every token
-// refresh — mirroring kimi-cli's `refresh_managed_models`
-// (research/kimi-cli/src/kimi_cli/auth/platforms.py), which keeps NO static
-// model list at all. The entries below are only the cold-start fallback used
-// when discovery has not produced a list yet in this process (offline start,
-// not logged in, or the chat hooks firing before the first discovery).
-// Fallback per-model metadata for the same cold-start path. Server-reported
-// `display_name` / `context_length` / `supports_*` flags always win over these.
-export const FALLBACK_MODELS: ReadonlyArray<{
-  id: string
-  display_name: string
-  context_length: number
-  supports_image_in: boolean
-  supports_video_in: boolean
-}> = [
-  { id: "k3", display_name: "Kimi K3", context_length: 1_048_576, supports_image_in: true, supports_video_in: false },
-  {
-    id: "kimi-for-coding",
-    display_name: "Kimi For Coding",
-    context_length: 256_000,
-    supports_image_in: true,
-    supports_video_in: false,
-  },
-  {
-    id: "kimi-for-coding-highspeed",
-    display_name: "Kimi For Coding High Speed",
-    context_length: 256_000,
-    supports_image_in: true,
-    supports_video_in: false,
-  },
-]
+// There is deliberately NO static model table here. kimi-cli keeps none, and
+// neither do we: the server's `GET /coding/v1/models` response (mirrored into
+// src/discovery-cache.ts after every success) is the only truth. Plugins that
+// hardcode model tables (e.g. antigravity-auth) do so because their upstream
+// has no discovery endpoint — Kimi has one.
 
-// Derived, never edited by hand — a separate literal would drift.
-export const FALLBACK_MODEL_IDS: readonly string[] = FALLBACK_MODELS.map((m) => m.id)
-
-// Last-resort context length when neither the server nor the fallback table
-// knows the model. Matches the K2.7 generation's window.
+// Last-resort context length when the server response omits `context_length`.
+// Matches the K2.7 generation's window.
 export const DEFAULT_CONTEXT_LENGTH = 256_000
 export const DEFAULT_OUTPUT_LIMIT = 65_536
 

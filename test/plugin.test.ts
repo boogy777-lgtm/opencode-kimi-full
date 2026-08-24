@@ -224,8 +224,21 @@ test("chat.params: `reasoningEffort` (camelCase) input also drives the mapping",
   expect(output.options.reasoningEffort).toBeUndefined()
 })
 
-test("chat.params: k3 keeps max reasoning effort unclamped", async () => {
+// Warm the plugin's discovery cache through provider.models so chat-hook
+// gating sees a server list (there is no static table anymore).
+async function warmDiscovery(models: unknown[]) {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) return { body: { data: models } }
+    return { body: { ok: true } }
+  })
   const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  return hooks
+}
+
+test("chat.params: k3 keeps max reasoning effort unclamped", async () => {
+  const hooks = await warmDiscovery([{ id: "k3", display_name: "Kimi K3", context_length: 1048576 }])
   const { output } = await callParams(
     hooks["chat.params"]!,
     { modelID: "k3", modelOptions: { reasoning_effort: "max" } },
@@ -236,7 +249,7 @@ test("chat.params: k3 keeps max reasoning effort unclamped", async () => {
 })
 
 test("chat.params: k3 clamps xhigh to high", async () => {
-  const { hooks } = await getHooks()
+  const hooks = await warmDiscovery([{ id: "k3", display_name: "Kimi K3", context_length: 1048576 }])
   const { output } = await callParams(
     hooks["chat.params"]!,
     { modelID: "k3", modelOptions: { reasoning_effort: "xhigh" } },
@@ -480,7 +493,7 @@ test("config: injects server-discovered models into the provider config at start
   })
 })
 
-test("config: falls back to the static model list when discovery fails", async () => {
+test("config: injects no model list when discovery fails and nothing is cached", async () => {
   await withTempAuthStore(validAuth(), async () => {
     mock = installFetchMock((call) => {
       if (call.url.endsWith("/coding/v1/models")) return { status: 500, body: { error: "oops" } }
@@ -489,11 +502,9 @@ test("config: falls back to the static model list when discovery fails", async (
     const { hooks } = await getHooks()
     const config: { provider?: Record<string, any> } = {}
     await hooks.config!(config as any)
-    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
-      "Kimi K3",
-      "Kimi For Coding",
-      "Kimi For Coding High Speed",
-    ])
+    // No server list, no cache → nothing is invented. Same contract as
+    // opencode core's gitlab discoverModels (returns {} on failure).
+    expect(config.provider?.[PROVIDER_ID]).toBeUndefined()
   })
 })
 
@@ -542,12 +553,8 @@ test("config: never throws when the network is down with a stored token", async 
     })
     const { hooks } = await getHooks()
     const config: { provider?: Record<string, any> } = {}
-    await hooks.config!(config as any)
-    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
-      "Kimi K3",
-      "Kimi For Coding",
-      "Kimi For Coding High Speed",
-    ])
+    await expect(hooks.config!(config as any)).resolves.toBeUndefined()
+    expect(config.provider?.[PROVIDER_ID]).toBeUndefined()
   })
 })
 
@@ -638,7 +645,7 @@ test("discovery cache: successful sync persists the list and revives it when the
   })
 })
 
-test("discovery cache: a corrupt cache is ignored and the static table wins", async () => {
+test("discovery cache: a corrupt cache is ignored and nothing is injected", async () => {
   await withTempAuthStore(validAuth(), async (root) => {
     await fs.mkdir(path.dirname(discoveryCachePath(root)), { recursive: true })
     await fs.writeFile(discoveryCachePath(root), "{not json", "utf8")
@@ -648,11 +655,7 @@ test("discovery cache: a corrupt cache is ignored and the static table wins", as
     const { hooks } = await getHooks()
     const config: { provider?: Record<string, any> } = {}
     await hooks.config!(config as any)
-    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
-      "Kimi K3",
-      "Kimi For Coding",
-      "Kimi For Coding High Speed",
-    ])
+    expect(config.provider?.[PROVIDER_ID]).toBeUndefined()
   })
 })
 

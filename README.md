@@ -76,7 +76,7 @@ You normally don't need this section. At every startup the plugin:
 2. queries `/coding/v1/models` for the authoritative model list of your account,
 3. injects the `kimi-for-coding-oauth` provider entry and one config entry per discovered model into opencode's runtime config (merging with — never overwriting — anything you wrote yourself).
 
-If the discovery call fails, degradation is graceful and visible: the plugin falls back to the **last-known-good model list** (persisted next to your auth store in `kimi-for-coding-oauth.models.json`), then to a static table (`Kimi K3`, `Kimi For Coding`, `Kimi For Coding High Speed`), and logs one actionable warning — including an HTTP 402 "membership check failed" hint when your Kimi Code subscription lapsed.
+If the discovery call fails, degradation is graceful and visible: the plugin falls back to the **last-known-good model list** (persisted next to your auth store in `kimi-for-coding-oauth.models.json`) and logs one actionable warning — including an HTTP 402 "membership check failed" hint when your Kimi Code subscription lapsed. If there is no cache either (fresh install, offline, never logged in), **nothing is injected** — the plugin never invents model entries. This mirrors kimi-cli (no static list at all) and opencode core's gitlab `discoverModels`, which returns nothing on failure; plugins that hardcode model tables do so only because their upstream lacks a discovery endpoint, which is not the case for Kimi.
 
 #### Naming: what you see is what you write (v1.6.0+)
 

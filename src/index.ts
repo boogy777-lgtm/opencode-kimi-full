@@ -6,7 +6,6 @@ import {
   API_BASE_URL,
   DEFAULT_CONTEXT_LENGTH,
   DEFAULT_OUTPUT_LIMIT,
-  FALLBACK_MODELS,
   MAX_REASONING_MODEL_IDS,
   MODEL_ID,
   PROVIDER_ID,
@@ -343,12 +342,11 @@ function prettifyModelId(modelId: string): string {
     .join(" ")
 }
 
-// Server-reported context length wins; then the fallback table; then the
-// K2.7-generation default. Mirrors kimi-cli, which trusts `context_length`
-// from `/models` unconditionally.
+// Server-reported context length wins; otherwise the K2.7-generation default.
+// Mirrors kimi-cli, which trusts `context_length` from `/models` unconditionally.
 function contextLengthFor(model: { id: string; context_length?: number }): number {
   if (model.context_length && model.context_length > 0) return model.context_length
-  return FALLBACK_MODELS.find((m) => m.id === model.id)?.context_length ?? DEFAULT_CONTEXT_LENGTH
+  return DEFAULT_CONTEXT_LENGTH
 }
 
 function effortVariants(): Record<string, Record<string, unknown>> {
@@ -598,8 +596,12 @@ const plugin: Plugin = async ({ client }) => {
     )
   }
 
-  const catalog = (): ReadonlyArray<KimiModelInfo> =>
-    cachedDiscovery.models?.length ? cachedDiscovery.models : FALLBACK_MODELS
+  // The catalog the chat hooks gate on: the server-discovered list once
+  // discovery has succeeded in this process, seeded from the last-known-good
+  // cache on cold starts. Empty until then — unknown references stay ungated
+  // so entitlement mistakes surface from the server instead of being silently
+  // decorated with Kimi-specific fields (kimi-cli keeps no static list either).
+  const catalog = (): ReadonlyArray<KimiModelInfo> => cachedDiscovery.models ?? []
 
   const syncProcessAuthContent = (auth: OAuthAuth) => {
     if (!process.env.OPENCODE_AUTH_CONTENT) return
@@ -714,7 +716,12 @@ const plugin: Plugin = async ({ client }) => {
             })()
           }
         }
-        upsertProviderConfig(input, models?.length ? models : FALLBACK_MODELS)
+        // No list from the server and no cache (fresh install offline, not
+        // logged in, or a lapsed membership with nothing cached): inject
+        // NOTHING rather than inventing entries — same contract as opencode
+        // core's gitlab discoverModels, which returns {} on failure. A
+        // user-written provider block still stands untouched.
+        if (models?.length) upsertProviderConfig(input, models)
       } catch {
         /* startup must never fail because of model sync */
       }
