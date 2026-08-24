@@ -315,6 +315,15 @@ A full description of the invariants that keep this working is in [`AGENTS.md`](
 
 </details>
 
+<details>
+<summary><strong>Troubleshooting: opencode fails to start with "Model not found: kimi-for-coding-oauth/…"</strong></summary>
+
+Your config references a Kimi model (default `model`, an agent, etc.) while the plugin has no model list yet — no successful `/models` sync and no cache. Since v1.7.1 the `config` hook repairs this automatically: every `<provider>/<key>` reference found in the runtime config gets a minimal placeholder entry (key doubles as the wire id, requests fail upstream until a real sync lands), so startup can no longer die on dangling references. A warning in the log lists exactly which keys were synthesized and why.
+
+If you are still on v1.7.0, upgrade the plugin — or temporarily point `model` at another provider.
+
+</details>
+
 ### License
 
 MIT.

@@ -659,6 +659,45 @@ test("discovery cache: a corrupt cache is ignored and nothing is injected", asyn
   })
 })
 
+test("config: dangling provider references are repaired so opencode can still start", async () => {
+  await withTempAuthStore(validAuth(), async () => {
+    mock = installFetchMock(() => {
+      throw new Error("network down")
+    })
+    const { hooks } = await getHooks()
+    // A default model + an agent referencing the provider while no list is
+    // available: without repair opencode dies on startup ("Model not found").
+    const config: Record<string, unknown> = {
+      model: `${PROVIDER_ID}/Kimi For Coding`,
+      agent: { general: { model: `${PROVIDER_ID}/kimi-for-coding` } },
+    }
+    await hooks.config!(config as any)
+    const models = (config.provider as any)[PROVIDER_ID].models
+    expect(models["Kimi For Coding"].id).toBe("Kimi For Coding")
+    expect(models["Kimi For Coding"].name).toBe("Kimi For Coding")
+    expect(models["Kimi For Coding"].variants.max).toEqual({ reasoning_effort: "max" })
+    expect(models["kimi-for-coding"].id).toBe("kimi-for-coding")
+  })
+})
+
+test("config: stale references are repaired alongside fresh discovery data", async () => {
+  await withTempAuthStore(validAuth(), async () => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) {
+        return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+      }
+      return { body: { ok: true } }
+    })
+    const { hooks } = await getHooks()
+    // Server no longer knows "k3", but the user's config still references it.
+    const config: Record<string, unknown> = { model: `${PROVIDER_ID}/k3` }
+    await hooks.config!(config as any)
+    const models = (config.provider as any)[PROVIDER_ID].models
+    expect(models["Kimi K4"].id).toBe("k4")
+    expect(models.k3.id).toBe("k3")
+  })
+})
+
 // ---------- auth.loader -----------------------------------------------------
 
 function jwt() {

@@ -506,19 +506,62 @@ function mergeModelConfig(generated: Record<string, unknown>, user: Record<strin
   return out
 }
 
-// Inject the provider entry and its model list into opencode's config before
-// providers initialize (same mechanism opencode-qwencode-auth uses). Model
-// set is server-discovered when possible, the static fallback otherwise.
-// kimi-cli's `_apply_models` treats `/models` as the full truth — union
-// semantics here gives the same "new models appear at startup" behavior while
-// never deleting entries the user wrote themselves.
-function upsertProviderConfig(input: { provider?: Record<string, ConfigProviderEntry> }, models: ReadonlyArray<KimiModelInfo>) {
+// Fill the provider-level fields any injection path needs before models land.
+function ensureProviderEntryDefaults(
+  input: { provider?: Record<string, ConfigProviderEntry> },
+): ConfigProviderEntry & { models: Record<string, Record<string, unknown>> } {
   input.provider ??= {}
   const provider = (input.provider[PROVIDER_ID] ??= {})
   provider.npm ??= "@ai-sdk/openai-compatible"
   provider.name ??= "Kimi For Coding (OAuth)"
   provider.options = { baseURL: API_BASE_URL, ...provider.options }
   provider.models ??= {}
+  return provider as ConfigProviderEntry & { models: Record<string, Record<string, unknown>> }
+}
+
+// Every `<PROVIDER_ID>/<key>` reference anywhere in the runtime config —
+// default model, agents, modes, wherever. Used to guarantee that anything the
+// user pointed at us actually resolves, even before the first successful
+// discovery (otherwise opencode refuses to start on an unresolvable default).
+function collectProviderModelRefs(value: unknown, out: Set<string> = new Set(), depth = 0): Set<string> {
+  if (!value || depth > 8) return out
+  if (typeof value === "string") {
+    if (value.startsWith(`${PROVIDER_ID}/`)) {
+      const key = value.slice(PROVIDER_ID.length + 1).trim()
+      if (key) out.add(key)
+    }
+    return out
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectProviderModelRefs(item, out, depth + 1)
+    return out
+  }
+  if (typeof value === "object") {
+    for (const item of Object.values(value as Record<string, unknown>)) collectProviderModelRefs(item, out, depth + 1)
+  }
+  return out
+}
+
+// Minimal placeholder for a referenced-but-unknown key. The key doubles as
+// the wire id: legacy slugs stay valid upstream; display-name keys fail loud
+// server-side instead of silently routing somewhere else.
+function bootstrapModelEntry(key: string): Record<string, unknown> {
+  return {
+    id: key,
+    name: key,
+    reasoning: true,
+    limit: { context: DEFAULT_CONTEXT_LENGTH, output: DEFAULT_OUTPUT_LIMIT },
+    options: {},
+    variants: effortVariants(),
+  }
+}
+
+// Inject the provider entry and its model list into opencode's config before
+// providers initialize (same mechanism opencode-qwencode-auth uses). Model
+// set is server-discovered when possible, the last-known-good cache second;
+// nothing is invented beyond what the user's own config references.
+function upsertProviderConfig(input: { provider?: Record<string, ConfigProviderEntry> }, models: ReadonlyArray<KimiModelInfo>) {
+  const provider = ensureProviderEntryDefaults(input)
   for (const { key, model } of keyedModels(models)) {
     const generated = configModelEntry(model)
     const existing = provider.models[key]
@@ -722,6 +765,22 @@ const plugin: Plugin = async ({ client }) => {
         // core's gitlab discoverModels, which returns {} on failure. A
         // user-written provider block still stands untouched.
         if (models?.length) upsertProviderConfig(input, models)
+
+        // ...but never leave a dangling reference: anything in the runtime
+        // config pointing at this provider must resolve, or opencode refuses
+        // to start ("Model not found" on cfg.model). Synthesize minimal
+        // placeholder entries for referenced keys that have no real entry.
+        const refs = collectProviderModelRefs(input)
+        if (refs.size) {
+          const provider = ensureProviderEntryDefaults(input)
+          const missing = [...refs].filter((key) => !provider.models[key])
+          if (missing.length) {
+            for (const key of missing) provider.models[key] = bootstrapModelEntry(key)
+            console.warn(
+              `[kimi-for-coding-oauth] no server model list available yet (offline start, login pending, or membership check failed) — synthesized placeholder entries for: ${missing.join(", ")}. Requests on them fail upstream until the first successful sync; restart after renewing/checking your plan at https://kimi.com/coding.`,
+            )
+          }
+        }
       } catch {
         /* startup must never fail because of model sync */
       }
