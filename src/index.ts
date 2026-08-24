@@ -158,8 +158,8 @@ function clampEffort(effort: string, serverModelId: string): string {
 // The catalog the chat hooks gate on: the server-discovered list once
 // discovery has succeeded in this process (kimi-cli keeps no static list at
 // all — removed/entitled-out models drop out, so their requests fail loud
-// server-side instead of carrying Kimi-specific fields), the last-known-good
-// cache second, the static table only before anything else is available.
+// server-side instead of carrying Kimi-specific fields), seeded from the
+// last-known-good cache on cold starts. Empty until then.
 function resolveKimiBodyFields(
   input: KimiHookInput,
   catalog: ReadonlyArray<KimiModelInfo>,
@@ -616,8 +616,8 @@ const plugin: Plugin = async ({ client }) => {
 
   // Seed the in-memory discovery from the last-known-good cache so a start
   // during an outage (or with a lapsed membership) still shows the full
-  // previously-seen list instead of shrinking to the static table. The server
-  // is still queried first everywhere; this is strictly fallback material.
+  // previously-seen list instead of an empty picker. The server is still
+  // queried first everywhere; this is strictly fallback material.
   try {
     const seeded = await readDiscoveryCache()
     if (seeded?.length) cachedDiscovery = { models: seeded }
@@ -729,9 +729,10 @@ const plugin: Plugin = async ({ client }) => {
      * tokens live ~15 min, so a cold start almost always holds an expired
      * one — refresh it first (same lock/refresh path the loader uses), then
      * discover. Degradation ladder when the server cannot serve the list:
-     * in-process discovery → last-known-good cache → static fallback, with
-     * one actionable console.warn explaining why. Never throws — a failing
-     * network must not break opencode startup.
+     * in-process discovery → last-known-good cache → inject nothing (only
+     * referenced-key placeholders get synthesized), with one actionable
+     * console.warn explaining why. Never throws — a failing network must not
+     * break opencode startup.
      */
     config: async (input) => {
       try {

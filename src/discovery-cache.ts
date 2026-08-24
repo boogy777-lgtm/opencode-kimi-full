@@ -9,7 +9,7 @@ import type { KimiModelInfo } from "./oauth.ts"
 // serve it right now — offline start, token refresh failure, or an HTTP 402
 // "membership benefits" rejection. The server is still queried first on every
 // startup and on every token refresh; this cache is strictly a fallback so a
-// lapsed subscription does not shrink the picker down to the static table.
+// lapsed subscription does not empty the picker.
 
 const CACHE_FILENAME = "kimi-for-coding-oauth.models.json"
 
