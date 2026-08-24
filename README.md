@@ -197,7 +197,7 @@ The plugin also backfills these capabilities at runtime from `/coding/v1/models`
 - The plugin queries `/coding/v1/models` at startup, during login, and on every token refresh so it always works with the account's current model entitlement: wire model ids, context lengths, and media capabilities.
 - The startup response feeds the config injection described in [Configure](#configure) — this is how newly released Kimi Code models appear in the picker without a plugin update.
 - The plugin uses the same discovery response to backfill image and video input support into opencode's runtime model metadata, so pasted or dropped images reach Kimi instead of being downgraded into local error text.
-- Generated config entries carry `limit.context` from the server-reported `context_length` (static doc values are only a fallback) and a conservative `output` limit of `65536`.
+- Generated config entries carry `limit.context` from the server-reported `context_length` (`256_000` default when the server omits it) and a conservative `output` limit of `65536`.
 - On a `401`, the loader refreshes the access token once and retries the request once.
 - Refreshes are coordinated through opencode's live auth store so concurrent workspaces do not keep using an older refresh-token chain from a stale `OPENCODE_AUTH_CONTENT` snapshot.
 
