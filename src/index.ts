@@ -544,12 +544,16 @@ function collectProviderModelRefs(value: unknown, out: Set<string> = new Set(), 
 
 // Minimal placeholder for a referenced-but-unknown key. The key doubles as
 // the wire id: legacy slugs stay valid upstream; display-name keys fail loud
-// server-side instead of silently routing somewhere else.
+// server-side instead of silently routing somewhere else. Image metadata is
+// required from the start — opencode strips image parts before the loader
+// ever sees them unless the entry advertises attachment/modalities.
 function bootstrapModelEntry(key: string): Record<string, unknown> {
   return {
     id: key,
     name: key,
     reasoning: true,
+    attachment: true,
+    modalities: { input: ["text", "image"], output: ["text"] },
     limit: { context: DEFAULT_CONTEXT_LENGTH, output: DEFAULT_OUTPUT_LIMIT },
     options: {},
     variants: effortVariants(),

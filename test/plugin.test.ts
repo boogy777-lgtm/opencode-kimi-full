@@ -675,6 +675,10 @@ test("config: dangling provider references are repaired so opencode can still st
     const models = (config.provider as any)[PROVIDER_ID].models
     expect(models["Kimi For Coding"].id).toBe("Kimi For Coding")
     expect(models["Kimi For Coding"].name).toBe("Kimi For Coding")
+    // Placeholders must advertise image input, or opencode strips image
+    // parts before the loader can discover the real capabilities.
+    expect(models["Kimi For Coding"].attachment).toBe(true)
+    expect(models["Kimi For Coding"].modalities).toEqual({ input: ["text", "image"], output: ["text"] })
     expect(models["Kimi For Coding"].variants.max).toEqual({ reasoning_effort: "max" })
     expect(models["kimi-for-coding"].id).toBe("kimi-for-coding")
   })
