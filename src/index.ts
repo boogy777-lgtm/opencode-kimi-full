@@ -1,11 +1,11 @@
 import type { Plugin, PluginModule } from "@opencode-ai/plugin"
 import { isAuthExpiring, refreshAuthWithLock } from "./auth-refresh.ts"
 import { isOAuthAuth, readAuth, type OAuthAuth } from "./auth-store.ts"
+import { readDiscoveryCache, writeDiscoveryCache } from "./discovery-cache.ts"
 import {
   API_BASE_URL,
   DEFAULT_CONTEXT_LENGTH,
   DEFAULT_OUTPUT_LIMIT,
-  FALLBACK_MODEL_IDS,
   FALLBACK_MODELS,
   MAX_REASONING_MODEL_IDS,
   MODEL_ID,
@@ -98,36 +98,79 @@ function pickEffort(options: Record<string, unknown> | undefined) {
   return typeof effort === "string" ? effort : undefined
 }
 
-function isKimiModel(modelId: string, known: ReadonlySet<string>): boolean {
-  return modelId === MODEL_ID || known.has(modelId)
+// --- WYSIWYG model naming ---------------------------------------------------
+//
+// Identity contract: the model key a user sees in the opencode picker is
+// exactly the string they reference from agent files and opencode.json
+// (`kimi-for-coding-oauth/<key>`). Keys are derived from the server's
+// `display_name`; the raw server slug travels on the wire separately via the
+// per-model `api.id` (opencode resolves wire ids through `model.api.id`, and
+// config-defined models accept an explicit `id` field for the same purpose).
+// The loader's fetch rewrite remains as a safety net for direct SDK callers.
+
+function displayNameKey(model: { id: string; display_name?: string }): string {
+  const name = model.display_name?.trim()
+  return name || model.id
 }
 
-// The known set is the server-discovered list once discovery has succeeded in
-// this process (kimi-cli keeps no static list at all — removed/entitled-out
-// models drop out of the gate, so their requests fail loud server-side
-// instead of carrying Kimi-specific fields). The static fallback only covers
-// the window before the first discovery.
-function knownModelIds(discovery: ModelDiscovery): ReadonlySet<string> {
-  if (discovery.models?.length) return new Set(discovery.models.map((m) => m.id))
-  return new Set(FALLBACK_MODEL_IDS)
+function normalizeKey(value: string): string {
+  return value.trim().toLowerCase()
 }
 
-function supportsMaxReasoning(modelId: string): boolean {
-  return (MAX_REASONING_MODEL_IDS as readonly string[]).includes(modelId)
+// Assign stable user-facing keys, preserving server order. On a display-name
+// collision (two models advertising the same name) the loser falls back to its
+// raw id so every entry stays addressable.
+function keyedModels(models: ReadonlyArray<KimiModelInfo>): Array<{ key: string; model: KimiModelInfo }> {
+  const used = new Set<string>()
+  return models.map((model) => {
+    let key = displayNameKey(model)
+    if (used.has(key)) key = model.id
+    used.add(key)
+    return { key, model }
+  })
 }
+
+// Resolve a requested model reference (config key, raw server id, or a
+// case/whitespace variant of either) to its server discovery entry.
+function findDiscovered(
+  requested: string | undefined,
+  models: ReadonlyArray<KimiModelInfo> | undefined,
+): KimiModelInfo | undefined {
+  if (!requested || !models?.length) return undefined
+  const byId = models.find((m) => m.id === requested)
+  if (byId) return byId
+  const byKey = models.find((m) => displayNameKey(m) === requested)
+  if (byKey) return byKey
+  const target = normalizeKey(requested)
+  if (!target) return undefined
+  return models.find((m) => normalizeKey(m.id) === target || normalizeKey(displayNameKey(m)) === target)
+}
+
 
 // kimi-cli clamps xhigh to "high" for all current Kimi Code models and also
 // clamps max to "high" for K2.7 models. K3 (model id "k3") keeps max as-is
 // because Kimi's backend supports it for the flagship model.
-function clampEffort(effort: string, modelId: string): string {
+function clampEffort(effort: string, serverModelId: string): string {
   if (effort === "xhigh") return "high"
-  if (effort === "max" && !supportsMaxReasoning(modelId)) return "high"
+  if (effort === "max" && !(MAX_REASONING_MODEL_IDS as readonly string[]).includes(serverModelId)) return "high"
   return effort
 }
 
-function resolveKimiBodyFields(input: KimiHookInput, known: ReadonlySet<string>): KimiBodyFields | undefined {
+// The catalog the chat hooks gate on: the server-discovered list once
+// discovery has succeeded in this process (kimi-cli keeps no static list at
+// all — removed/entitled-out models drop out, so their requests fail loud
+// server-side instead of carrying Kimi-specific fields), the last-known-good
+// cache second, the static table only before anything else is available.
+function resolveKimiBodyFields(
+  input: KimiHookInput,
+  catalog: ReadonlyArray<KimiModelInfo>,
+): KimiBodyFields | undefined {
   if (input.model.providerID !== PROVIDER_ID) return
-  if (!isKimiModel(input.model.id, known)) return
+  const info = findDiscovered(input.model.id, catalog)
+  // Unknown references stay ungated so entitlement mistakes surface from the
+  // server instead of being silently decorated with Kimi-specific fields.
+  // MODEL_ID remains accepted as the legacy wire placeholder.
+  if (!info && input.model.id !== MODEL_ID) return
 
   const modelOptions = asRecord(input.model.options)
   const variantOptions = input.message.model.variant
@@ -137,7 +180,9 @@ function resolveKimiBodyFields(input: KimiHookInput, known: ReadonlySet<string>)
   const fields: KimiBodyFields = { prompt_cache_key: input.sessionID }
   const thinking = asThinking(variantOptions?.thinking) ?? asThinking(modelOptions?.thinking)
   const rawEffort = pickEffort(variantOptions) ?? pickEffort(modelOptions)
-  const effort = rawEffort ? clampEffort(rawEffort, input.model.id) : undefined
+  // Capability checks always use the SERVER id ("k3"), never the user-facing
+  // display key, so clamping stays correct no matter how the model was named.
+  const effort = rawEffort ? clampEffort(rawEffort, info?.id ?? input.model.id) : undefined
 
   if (effort === "auto") return fields
   if (effort === "off") {
@@ -349,13 +394,14 @@ function buildRuntimeModel(discovered: KimiModelInfo): Record<string, unknown> {
 function applyDiscoveryToModels<T extends Record<string, ModelWithDiscoveryMetadata>>(
   models: T,
   discovery: KimiModelInfo[],
-  known: ReadonlySet<string>,
 ): T {
   let changed = false
   const nextModels = { ...models } as T
+  // Patch every existing entry that resolves to a discovered model — by
+  // user-facing key or raw id, so both pre-v1.6 (raw-id) configs and current
+  // display-keyed ones receive fresh metadata.
   for (const [modelId, model] of Object.entries(models)) {
-    if (!isKimiModel(modelId, known)) continue
-    const discovered = discovery.find((m) => m.id === modelId)
+    const discovered = findDiscovered(modelId, discovery)
     if (!discovered) continue
     const next = withDiscoveredMediaInput(
       withDiscoveredContext(withDiscoveredDisplayName(model, discovered.display_name), discovered.context_length),
@@ -367,10 +413,11 @@ function applyDiscoveryToModels<T extends Record<string, ModelWithDiscoveryMetad
     changed = true
   }
   // kimi-cli's `_apply_models` materializes every server-returned model; do
-  // the same so newly released Kimi Code models appear without a config edit.
-  for (const discovered of discovery) {
-    if (nextModels[discovered.id]) continue
-    ;(nextModels as Record<string, unknown>)[discovered.id] = buildRuntimeModel(discovered)
+  // the same under the WYSIWYG key so newly released Kimi Code models appear
+  // without a config edit.
+  for (const { key, model } of keyedModels(discovery)) {
+    if (nextModels[key]) continue
+    ;(nextModels as Record<string, unknown>)[key] = buildRuntimeModel(model)
     changed = true
   }
   return changed ? nextModels : models
@@ -407,12 +454,19 @@ function buildModelConfig(
 function configModelEntry(model: { id: string; display_name?: string; context_length?: number; supports_image_in?: boolean; supports_video_in?: boolean }) {
   // Fall back to image=true because all current Kimi Code models support
   // image input; video only when the server explicitly says so.
-  return buildModelConfig(
+  const entry = buildModelConfig(
     model.display_name ?? prettifyModelId(model.id),
     contextLengthFor(model),
     model.supports_image_in ?? true,
     model.supports_video_in ?? false,
   )
+  return {
+    // The server slug that must travel on the wire. opencode resolves wire
+    // ids through this field (`apiID = model.id ?? ... ?? key` in
+    // provider.ts), letting the config key be the human-readable name.
+    id: model.id,
+    ...entry,
+  }
 }
 
 function buildConfigBlock(models: KimiModelInfo[]) {
@@ -423,7 +477,7 @@ function buildConfigBlock(models: KimiModelInfo[]) {
           npm: "@ai-sdk/openai-compatible",
           name: "Kimi For Coding (OAuth)",
           options: { baseURL: API_BASE_URL },
-          models: Object.fromEntries(models.map((model) => [model.id, configModelEntry(model)])),
+          models: Object.fromEntries(keyedModels(models).map(({ key, model }) => [key, configModelEntry(model)])),
         },
       },
     },
@@ -467,10 +521,10 @@ function upsertProviderConfig(input: { provider?: Record<string, ConfigProviderE
   provider.name ??= "Kimi For Coding (OAuth)"
   provider.options = { baseURL: API_BASE_URL, ...provider.options }
   provider.models ??= {}
-  for (const model of models) {
+  for (const { key, model } of keyedModels(models)) {
     const generated = configModelEntry(model)
-    const existing = provider.models[model.id]
-    provider.models[model.id] = isPlainObject(existing) ? mergeModelConfig(generated, existing) : generated
+    const existing = provider.models[key]
+    provider.models[key] = isPlainObject(existing) ? mergeModelConfig(generated, existing) : generated
   }
 }
 
@@ -513,6 +567,39 @@ const plugin: Plugin = async ({ client }) => {
 
   let cachedDiscovery: ModelDiscovery = {}
   let refreshPromise: Promise<OAuthAuth> | undefined
+  let warnedDiscoveryFailure = false
+
+  // Seed the in-memory discovery from the last-known-good cache so a start
+  // during an outage (or with a lapsed membership) still shows the full
+  // previously-seen list instead of shrinking to the static table. The server
+  // is still queried first everywhere; this is strictly fallback material.
+  try {
+    const seeded = await readDiscoveryCache()
+    if (seeded?.length) cachedDiscovery = { models: seeded }
+  } catch {}
+
+  // One actionable log line per process when model sync degrades — silence
+  // here reads as "the plugin is broken" and sends users hunting for the
+  // wrong cause.
+  const warnDiscoveryFailure = (error: unknown) => {
+    if (warnedDiscoveryFailure) return
+    warnedDiscoveryFailure = true
+    const status = (error as { status?: number }).status
+    const detail =
+      status === 402
+        ? "membership check failed — renew or verify your plan at https://kimi.com/coding"
+        : status === 401 || status === 403
+          ? "authentication failed — run `opencode auth login kimi-for-coding-oauth`"
+          : error instanceof Error
+            ? error.message
+            : String(error)
+    console.warn(
+      `[kimi-for-coding-oauth] model sync failed${status ? ` (HTTP ${status})` : ""}: ${detail}. Using the last known model list.`,
+    )
+  }
+
+  const catalog = (): ReadonlyArray<KimiModelInfo> =>
+    cachedDiscovery.models?.length ? cachedDiscovery.models : FALLBACK_MODELS
 
   const syncProcessAuthContent = (auth: OAuthAuth) => {
     if (!process.env.OPENCODE_AUTH_CONTENT) return
@@ -529,12 +616,19 @@ const plugin: Plugin = async ({ client }) => {
     syncProcessAuthContent(auth)
   }
 
-  const rememberDiscovery = (models: KimiModelInfo[]): ModelDiscovery => {
+  const rememberDiscovery = async (models: KimiModelInfo[]): Promise<ModelDiscovery> => {
     // Always overwrite, even with an empty list: a successful `/models`
     // response is authoritative (kimi-cli removes gone models), so stale
     // entries must not survive it. Errors never reach this call — callers
     // keep their previous cache on failure.
     cachedDiscovery = { models }
+    if (models.length) {
+      // Awaited (not fire-and-forget) so restarts immediately after startup
+      // still observe the persisted list. Local-file write, sub-millisecond.
+      try {
+        await writeDiscoveryCache(models)
+      } catch {}
+    }
     return cachedDiscovery
   }
 
@@ -585,8 +679,10 @@ const plugin: Plugin = async ({ client }) => {
      * provider's model picker without any manual config block. Kimi access
      * tokens live ~15 min, so a cold start almost always holds an expired
      * one — refresh it first (same lock/refresh path the loader uses), then
-     * discover; the static fallback is only for refresh-and-retry failure.
-     * Never throws — a failing network must not break opencode startup.
+     * discover. Degradation ladder when the server cannot serve the list:
+     * in-process discovery → last-known-good cache → static fallback, with
+     * one actionable console.warn explaining why. Never throws — a failing
+     * network must not break opencode startup.
      */
     config: async (input) => {
       try {
@@ -598,12 +694,21 @@ const plugin: Plugin = async ({ client }) => {
               try {
                 const fresh = isAuthExpiring(auth) ? await refreshAuth(auth) : auth
                 try {
-                  return rememberDiscovery(await listModels(fresh.access)).models
+                  return (await rememberDiscovery(await listModels(fresh.access))).models
                 } catch (error) {
-                  if ((error as { status?: number }).status !== 401) return undefined
-                  return rememberDiscovery(await listModels((await refreshAuth(fresh, true)).access)).models
+                  if ((error as { status?: number }).status !== 401) {
+                    warnDiscoveryFailure(error)
+                    return undefined
+                  }
+                  try {
+                    return (await rememberDiscovery(await listModels((await refreshAuth(fresh, true)).access))).models
+                  } catch (retryError) {
+                    warnDiscoveryFailure(retryError)
+                    return undefined
+                  }
                 }
-              } catch {
+              } catch (error) {
+                warnDiscoveryFailure(error)
                 return undefined
               }
             })()
@@ -620,8 +725,8 @@ const plugin: Plugin = async ({ client }) => {
         if (!isOAuthAuth(ctx.auth)) return provider.models
 
         const discover = async (auth: OAuthAuth) => {
-          const models = rememberDiscovery(await listModels(auth.access)).models ?? []
-          return applyDiscoveryToModels(provider.models, models, knownModelIds(cachedDiscovery))
+          const models = (await rememberDiscovery(await listModels(auth.access))).models ?? []
+          return applyDiscoveryToModels(provider.models, models)
         }
 
         const current = (await readCurrentAuth()) ?? ctx.auth
@@ -630,12 +735,16 @@ const plugin: Plugin = async ({ client }) => {
           if (isAuthExpiring(auth)) auth = await refreshAuth(auth)
           return await discover(auth)
         } catch (error) {
-          if (auth !== current || (error as { status?: number }).status !== 401) return provider.models
+          if (auth !== current || (error as { status?: number }).status !== 401) {
+            warnDiscoveryFailure(error)
+            return provider.models
+          }
         }
 
         try {
           return await discover(await refreshAuth(current, true))
-        } catch {
+        } catch (error) {
+          warnDiscoveryFailure(error)
           return provider.models
         }
       },
@@ -663,7 +772,7 @@ const plugin: Plugin = async ({ client }) => {
           // (`refresh`/`access`/`expires`) on `client.auth.set`, so discovery
           // cannot live durably in auth.json across refresh writes. Cache it in
           // this loader instance instead, and repopulate lazily on startup.
-          discovery = rememberDiscovery(await listModels(access))
+          discovery = await rememberDiscovery(await listModels(access))
           return discovery
         }
 
@@ -761,19 +870,20 @@ const plugin: Plugin = async ({ client }) => {
                   const parsed = JSON.parse(originalBody)
                   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
                     const requestedModelId = typeof parsed.model === "string" ? parsed.model : undefined
-                    // Look up the discovered wire id for the requested model.
-                    // The legacy MODEL_ID placeholder falls back to the
+                    // Resolve the requested reference (user-facing key, raw
+                    // server id, or case/whitespace variant) to its discovery
+                    // entry. The legacy MODEL_ID placeholder falls back to the
                     // discovered slug ONLY when discovery returned exactly one
                     // model — that pick is unambiguous. With several models
                     // (or none), guessing models[0] could silently run the
                     // request on a different model than the user selected, so
                     // we leave the id on the wire and let the server answer
                     // with a visible entitlement error instead.
-                    const discovered = requestedModelId
-                      ? (auth.models?.find((m) => m.id === requestedModelId) ??
+                    const info = requestedModelId
+                      ? (findDiscovered(requestedModelId, auth.models) ??
                         (requestedModelId === MODEL_ID && auth.models?.length === 1 ? auth.models[0] : undefined))
                       : undefined
-                    const targetModel = discovered?.id
+                    const targetModel = info?.id
                     const changedBody =
                       (targetModel && targetModel !== requestedModelId) || hasKimiBodyFields(kimiBodyFields)
                     if (targetModel && targetModel !== requestedModelId) {
@@ -828,7 +938,7 @@ const plugin: Plugin = async ({ client }) => {
                   // the loader will re-attempt discovery before the first
                   // model-rewrite that needs it.
                   try {
-                    const models = rememberDiscovery(await listModels(tokens.access_token)).models ?? []
+                    const models = (await rememberDiscovery(await listModels(tokens.access_token))).models ?? []
                     if (models.length) {
                       // Print the discovered model set. opencode shows this
                       // next to the "Authorized" message.
@@ -859,7 +969,7 @@ const plugin: Plugin = async ({ client }) => {
     },
 
     "chat.headers": async (input, output) => {
-      const fields = resolveKimiBodyFields(input as KimiHookInput, knownModelIds(cachedDiscovery))
+      const fields = resolveKimiBodyFields(input as KimiHookInput, catalog())
       if (!fields) return
       if (fields.prompt_cache_key) {
         output.headers[INTERNAL_PROMPT_CACHE_KEY_HEADER] = fields.prompt_cache_key
@@ -881,7 +991,7 @@ const plugin: Plugin = async ({ client }) => {
      * working if upstream aligns those keys later.
      */
     "chat.params": async (input, output) => {
-      const fields = resolveKimiBodyFields(input as KimiHookInput, knownModelIds(cachedDiscovery))
+      const fields = resolveKimiBodyFields(input as KimiHookInput, catalog())
       if (!fields) return
       applyKimiBodyFields(output.options, fields)
     },

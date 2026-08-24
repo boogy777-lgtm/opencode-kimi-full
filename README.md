@@ -76,9 +76,21 @@ You normally don't need this section. At every startup the plugin:
 2. queries `/coding/v1/models` for the authoritative model list of your account,
 3. injects the `kimi-for-coding-oauth` provider entry and one config entry per discovered model into opencode's runtime config (merging with — never overwriting — anything you wrote yourself).
 
-If the discovery call fails (offline start, expired token before the first refresh), a static fallback list (`k3`, `kimi-for-coding`, `kimi-for-coding-highspeed`) is injected instead so the plugin keeps working. kimi-cli manages its model list the same way: the server response is the only truth.
+If the discovery call fails, degradation is graceful and visible: the plugin falls back to the **last-known-good model list** (persisted next to your auth store in `kimi-for-coding-oauth.models.json`), then to a static table (`Kimi K3`, `Kimi For Coding`, `Kimi For Coding High Speed`), and logs one actionable warning — including an HTTP 402 "membership check failed" hint when your Kimi Code subscription lapsed.
 
-Add a config block only to **override** generated entries. Your keys win per-field; everything else stays generated. Example — rename a model and pin a custom variant:
+#### Naming: what you see is what you write (v1.6.0+)
+
+The model key shown in the opencode picker is **exactly** the string you reference from agent files and `opencode.json`:
+
+```yaml
+model: kimi-for-coding-oauth/Kimi K3        # ← the key IS the picker label
+```
+
+Keys are derived from the server's `display_name`; the raw server slug (`k3`) rides on the wire automatically via each entry's `id` field (opencode resolves wire ids through it), so you never deal with slugs unless you want to — referencing `kimi-for-coding-oauth/k3` directly also still works.
+
+> **Migrating from v1.5.x:** replace raw-slug references with display names — `kimi-for-coding-oauth/kimi-for-coding` → `kimi-for-coding-oauth/Kimi For Coding`, `kimi-for-coding-oauth/k3` → `kimi-for-coding-oauth/Kimi K3`. Old manual provider blocks can simply be deleted; the plugin injects everything itself.
+
+Add a config block only to **override** generated entries — under the same display-name key. Your keys win per-field; everything else stays generated:
 
 ```json
 {
@@ -86,7 +98,7 @@ Add a config block only to **override** generated entries. Your keys win per-fie
   "provider": {
     "kimi-for-coding-oauth": {
       "models": {
-        "k3": {
+        "Kimi K3": {
           "name": "Kimi K3 (mine)",
           "variants": {
             "max": { "reasoning_effort": "max" }
@@ -102,7 +114,8 @@ Generated model entries look like this (shown for reference; `context` comes fro
 
 ```json
 {
-  "k3": {
+  "Kimi K3": {
+    "id": "k3",
     "name": "Kimi K3",
     "attachment": true,
     "reasoning": true,
@@ -126,7 +139,7 @@ Generated model entries look like this (shown for reference; `context` comes fro
 
 > **Important:** The generated `attachment` and `modalities` fields are what make image input work — opencode strips image parts before they reach Kimi without them. The plugin injects them from the server's `supports_image_in` / `supports_video_in` flags; if you fully replace a model entry in your own config, keep those fields.
 
-The **provider id** `kimi-for-coding-oauth` is fixed -- the plugin's `auth` and chat hooks match on it. **Model ids** come from `/coding/v1/models` (`k3`, `kimi-for-coding`, `kimi-for-coding-highspeed` as of writing); the plugin rewrites the wire `model` field to the server-reported slug on every request, and new ids the server starts returning show up in the picker after the next restart.
+The **provider id** `kimi-for-coding-oauth` is fixed -- the plugin's `auth` and chat hooks match on it. **Model keys** come from the server's `display_name`; the plugin rewrites the wire `model` field to the server-reported slug on every request (belt to the `id` field's suspenders), and models the server starts returning appear under their names after the next restart.
 
 > **Note.** The provider id is intentionally not `kimi-for-coding`. That id is already published by [models.dev](https://models.dev) and points at a static-API-key flow using a different SDK and auth shape. Using a distinct id keeps the two paths from colliding under a single `opencode auth login` entry.
 

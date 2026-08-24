@@ -309,7 +309,10 @@ test("provider.models: materializes a discovered model that is missing from the 
   const { hooks } = await getHooks()
   const provider = makeProviderState()
   const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
-  const k4 = next["k4"] as any
+  // WYSIWYG keys: the entry is addressable by the display name; the raw slug
+  // rides on the wire via api.id. A model without a display_name falls back
+  // to its id as the key.
+  const k4 = next["Kimi K4"] as any
   expect(k4.name).toBe("Kimi K4")
   expect(k4.status).toBe("active")
   expect(k4.api).toEqual({ id: "k4", url: "https://api.kimi.com/coding/v1", npm: "@ai-sdk/openai-compatible" })
@@ -318,8 +321,9 @@ test("provider.models: materializes a discovered model that is missing from the 
   expect(k4.capabilities.input.image).toBe(true)
   expect(k4.capabilities.input.video).toBe(true)
   expect(k4.variants.max).toEqual({ reasoning_effort: "max" })
+  expect(next[MODEL_ID]).toBeDefined()
   // The caller's model map is never mutated.
-  expect((provider.models as Record<string, unknown>)["k4"]).toBeUndefined()
+  expect((provider.models as Record<string, unknown>)["Kimi K4"]).toBeUndefined()
 })
 
 test("chat.params: attaches Kimi fields for a model known only from server discovery", async () => {
@@ -382,6 +386,64 @@ test("chat.params: a fallback-id model drops out of the gate once discovery succ
   expect(output.options.thinking).toBeUndefined()
 })
 
+test("chat.params: the picker name is a valid reference and capability checks resolve to the server id", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [
+            { id: "k3", display_name: "Kimi K3", context_length: 1048576 },
+            { id: "k4", display_name: "Kimi K4", context_length: 2097152 },
+          ],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  // What the user sees in the picker ("Kimi K4") is what goes in the agent.
+  const k4 = await callParams(hooks["chat.params"]!, { modelID: "Kimi K4", modelOptions: { reasoning_effort: "high" } }, { reasoning_effort: "high" })
+  expect(k4.output.options.prompt_cache_key).toBe("sess-1")
+  expect(k4.output.options.reasoning_effort).toBe("high")
+  // Case-insensitive tolerance on the same key...
+  const lower = await callParams(hooks["chat.params"]!, { modelID: "kimi k4" }, {})
+  expect(lower.output.options.prompt_cache_key).toBe("sess-1")
+  // ...and `max` survives on "Kimi K3" because the capability check resolved
+  // the key back to the server id "k3" (a member of MAX_REASONING_MODEL_IDS).
+  const k3max = await callParams(hooks["chat.params"]!, { modelID: "Kimi K3", modelOptions: { reasoning_effort: "max" } }, { reasoning_effort: "max" })
+  expect(k3max.output.options.reasoning_effort).toBe("max")
+})
+
+// ---------- WYSIWYG wire rewrite ---------------------------------------------
+
+test("auth.loader: rewrites the picker name (and case variants) to the server slug on the wire", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+    }
+    return { body: { ok: true } }
+  })
+  const { fetch } = await getLoaderFetch(async () => validAuth())
+  const send = async (modelId: string) => {
+    await fetch("https://api.kimi.com/coding/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: modelId, messages: [] }),
+    })
+  }
+  await send("Kimi K4")
+  await send("kimi k4")
+  await send("k4")
+  const bodies = mock!.calls
+    .filter((c) => c.url.endsWith("/coding/v1/chat/completions"))
+    .map((c) => JSON.parse(c.body!) as { model: string })
+  // Exact key and case-insensitive variant both resolve to the server slug;
+  // an exact server id passes through untouched.
+  expect(bodies.map((b) => b.model)).toEqual(["k4", "k4", "k4"])
+})
+
 // ---------- config hook (startup model sync) ---------------------------------
 
 test("config: injects server-discovered models into the provider config at startup", async () => {
@@ -406,8 +468,10 @@ test("config: injects server-discovered models into the provider config at start
     expect(provider.npm).toBe("@ai-sdk/openai-compatible")
     expect(provider.name).toBe("Kimi For Coding (OAuth)")
     expect(provider.options.baseURL).toBe("https://api.kimi.com/coding/v1")
-    expect(Object.keys(provider.models)).toEqual(["k3", "k4"])
-    const k4 = provider.models["k4"]
+    // WYSIWYG: config keys are the display names users see in the picker.
+    expect(Object.keys(provider.models)).toEqual(["Kimi K3", "Kimi K4"])
+    const k4 = provider.models["Kimi K4"]
+    expect(k4.id).toBe("k4")
     expect(k4.name).toBe("Kimi K4")
     expect(k4.reasoning).toBe(true)
     expect(k4.limit).toEqual({ context: 2097152, output: 65536 })
@@ -426,9 +490,9 @@ test("config: falls back to the static model list when discovery fails", async (
     const config: { provider?: Record<string, any> } = {}
     await hooks.config!(config as any)
     expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
-      "k3",
-      "kimi-for-coding",
-      "kimi-for-coding-highspeed",
+      "Kimi K3",
+      "Kimi For Coding",
+      "Kimi For Coding High Speed",
     ])
   })
 })
@@ -446,23 +510,28 @@ test("config: user model overrides win over generated entries", async () => {
       provider: {
         [PROVIDER_ID]: {
           models: {
-            k3: {
+            // Overrides live under the same WYSIWYG key users reference in
+            // agents. A legacy raw-id entry (pre-v1.6) must be preserved as-is.
+            "Kimi K3": {
               name: "My K3",
               limit: { context: 999_999 },
               variants: { high: { reasoning_effort: "high", temperature: 0.2 } },
             },
+            k3: { name: "legacy entry" },
           },
         },
       },
     }
     await hooks.config!(config as any)
-    const k3 = (config.provider as any)[PROVIDER_ID].models.k3
+    const models = (config.provider as any)[PROVIDER_ID].models
+    const k3 = models["Kimi K3"]
     expect(k3.name).toBe("My K3")
     // Scalar user values win; untouched generated keys are preserved.
     expect(k3.limit).toEqual({ context: 999_999, output: 65536 })
     expect(k3.variants.high).toEqual({ reasoning_effort: "high", temperature: 0.2 })
     expect(k3.variants.max).toEqual({ reasoning_effort: "max" })
     expect(k3.modalities).toEqual({ input: ["text", "image"], output: ["text"] })
+    expect(models.k3).toEqual({ name: "legacy entry" })
   })
 })
 
@@ -475,9 +544,9 @@ test("config: never throws when the network is down with a stored token", async 
     const config: { provider?: Record<string, any> } = {}
     await hooks.config!(config as any)
     expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
-      "k3",
-      "kimi-for-coding",
-      "kimi-for-coding-highspeed",
+      "Kimi K3",
+      "Kimi For Coding",
+      "Kimi For Coding High Speed",
     ])
   })
 })
@@ -504,7 +573,8 @@ test("config: refreshes an expiring stored token before startup discovery", asyn
       "https://auth.kimi.com/api/oauth/token",
       "https://api.kimi.com/coding/v1/models",
     ])
-    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["k4"])
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["Kimi K4"])
+
     expect(writes.some((w) => (w.body as { access?: string }).access === "fresh")).toBe(true)
   })
 })
@@ -531,7 +601,58 @@ test("config: retries discovery once with a forced refresh on 401", async () => 
       "https://auth.kimi.com/api/oauth/token",
       "https://api.kimi.com/coding/v1/models",
     ])
-    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["k4"])
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["Kimi K4"])
+  })
+})
+
+// ---------- last-known-good discovery cache ----------------------------------
+
+function discoveryCachePath(root: string) {
+  return path.join(root, "opencode", "kimi-for-coding-oauth.models.json")
+}
+
+test("discovery cache: successful sync persists the list and revives it when the server is unreachable", async () => {
+  await withTempAuthStore(validAuth(), async (root) => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) {
+        return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+      }
+      return { body: { ok: true } }
+    })
+    const first = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await first.hooks.config!(config as any)
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["Kimi K4"])
+    await expect(fs.readFile(discoveryCachePath(root), "utf8")).resolves.toContain("Kimi K4")
+
+    // Server goes dark; a brand-new plugin instance must still see the full
+    // previously-discovered list instead of the static fallback.
+    mock.restore()
+    mock = installFetchMock(() => {
+      throw new Error("network down")
+    })
+    const second = await getHooks()
+    const config2: { provider?: Record<string, any> } = {}
+    await second.hooks.config!(config2 as any)
+    expect(Object.keys(config2.provider![PROVIDER_ID]!.models)).toEqual(["Kimi K4"])
+  })
+})
+
+test("discovery cache: a corrupt cache is ignored and the static table wins", async () => {
+  await withTempAuthStore(validAuth(), async (root) => {
+    await fs.mkdir(path.dirname(discoveryCachePath(root)), { recursive: true })
+    await fs.writeFile(discoveryCachePath(root), "{not json", "utf8")
+    mock = installFetchMock(() => {
+      throw new Error("network down")
+    })
+    const { hooks } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual([
+      "Kimi K3",
+      "Kimi For Coding",
+      "Kimi For Coding High Speed",
+    ])
   })
 })
 
@@ -1336,9 +1457,10 @@ test("auth callback prints a schema-valid config snippet with top-level model va
   const parsed = JSON.parse(text.slice(start, end + 1)) as {
     provider: {
       [key: string]: {
-        models: {
-          [key: string]: {
-            attachment?: boolean
+      models: {
+        [key: string]: {
+          id?: string
+          attachment?: boolean
             limit?: { context?: number }
             modalities?: { input?: string[]; output?: string[] }
             options?: Record<string, unknown>
@@ -1348,8 +1470,9 @@ test("auth callback prints a schema-valid config snippet with top-level model va
       }
     }
   }
-  const model = parsed.provider[PROVIDER_ID]!.models[MODEL_ID]!
+  const model = parsed.provider[PROVIDER_ID]!.models["Kimi Code"]!
   expect(text).toContain("models: kimi-for-coding")
+  expect(model.id).toBe("kimi-for-coding")
   expect(model.attachment).toBe(true)
   // The discovered context_length wins over the static doc fallback.
   expect(model.limit).toEqual({ context: 262144, output: 65_536 })
