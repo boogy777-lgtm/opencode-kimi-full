@@ -9,8 +9,8 @@ Compared with stock opencode Kimi setups, this plugin:
 - sends the same `User-Agent` / `X-Msh-*` fingerprint headers as `kimi-cli`
 - reuses `~/.kimi/device_id` for `X-Msh-Device-Id`
 - adds `prompt_cache_key`, `thinking`, and `reasoning_effort` for Kimi Code requests
-- syncs the full model list from `/coding/v1/models` at every startup, so newly released Kimi Code models appear in the picker without a plugin update or config edits
-- discovers the authoritative wire model slug, display name, context length, and media-input capabilities from `/coding/v1/models`
+- syncs the full model list from `/coding/v1/models` at every startup (server-first; the last-known-good cache only covers failed queries), so newly released Kimi Code models appear in the picker without a plugin update or config edits
+- discovers the authoritative wire model slug, display name, context length, and media-input capabilities from `/coding/v1/models` (`attachment`/`modalities` are omitted when the server reports `supports_image_in: false`)
 - keeps tokens in opencode's auth store while mirroring `kimi-cli`'s refresh / retry behavior
 - provides a `/kimi:usage` TUI command to check subscription usage
 
@@ -218,7 +218,7 @@ These variants only affect Kimi's reasoning request fields. They do not switch m
 - `off` asks the backend to disable thinking
 - `auto` leaves the decision to the server
 - `low` / `medium` / `high` ask for enabled thinking with the corresponding reasoning effort
-- `max` asks for the highest reasoning effort. For `k3` it is sent as `max`; for `kimi-for-coding` and `kimi-for-coding-highspeed` it is clamped to `high` to match kimi-cli behavior.
+- `max` asks for the highest reasoning effort. It passes through only for models whose discovery payload advertises it via `think_efforts.valid_efforts` (currently `k3` and `k3-256k`); for everything else — including K2.7 models and models the server says nothing about — it is clamped to `high`, because an unsupported effort value fails the request upstream.
 - `xhigh` is clamped to `high` for all models.
 
 Every Kimi Code request also gets `prompt_cache_key` set to opencode's session id. That mirrors `kimi-cli`'s cache hint so follow-up turns in the same session can reuse Kimi's prompt cache.
@@ -256,7 +256,7 @@ Stock opencode can already talk to generic Moonshot and OpenAI-compatible endpoi
 | Field | Wire shape | Purpose |
 |---|---|---|
 | `prompt_cache_key` | top-level body, snake_case, set to opencode's `sessionID` | Opt-in, session-scoped cache key, mirroring kimi-cli. |
-| `thinking` + `reasoning_effort` | `thinking: { type: "enabled" \| "disabled" }` with sibling `reasoning_effort: "low" \| "medium" \| "high" \| "max"` | Sent together, matching kimi-cli. `max` kept for `k3`, clamped to `high` for K2.7 models; `xhigh` clamped to `high`. |
+| `thinking` + `reasoning_effort` | `thinking: { type: "enabled" \| "disabled" }` with sibling `reasoning_effort: "low" \| "medium" \| "high" \| "max"` | Sent together, matching kimi-cli. `max` passes for models advertising it in `think_efforts.valid_efforts` (k3, k3-256k), clamped to `high` otherwise; `xhigh` clamped to `high`. Both fields are omitted entirely when discovery reports `supports_reasoning: false`. |
 | Seven `X-Msh-*` headers + UA | `User-Agent`, `X-Msh-Platform`, `X-Msh-Version`, `X-Msh-Device-Name`, `X-Msh-Device-Model`, `X-Msh-Device-Id`, `X-Msh-Os-Version` | Matches kimi-cli's `_common_headers()` at the pinned `KIMI_CLI_VERSION`. |
 | `/coding/v1/models` discovery | `id`, `display_name`, `context_length`, `supports_image_in`, `supports_video_in` | Supplies the authoritative wire model slug plus runtime model metadata. |
 | `~/.kimi/device_id` | UUID persisted on disk, embedded in `X-Msh-Device-Id` | Sends the same `X-Msh-Device-Id` as a locally-installed kimi-cli. |
@@ -265,12 +265,13 @@ Effort-to-field mapping used by the plugin:
 
 | user effort | `reasoning_effort` | `thinking` | model |
 |---|---|---|---|
-| `auto` | *(omitted)* | *(omitted)* -- server picks dynamically | any |
-| `off` | *(omitted)* | `{ type: "disabled" }` | any |
+| `auto` | *(omitted)* | *(omitted)* -- server picks dynamically | any, unless `supports_thinking_type: "only"` |
+| `off` | *(omitted)* | `{ type: "disabled" }` | any, unless `supports_thinking_type: "only"` |
 | `low` / `medium` / `high` | same string | `{ type: "enabled" }` | any |
-| `max` | `max` | `{ type: "enabled" }` | `k3` |
-| `max` | `"high"` (clamped) | `{ type: "enabled" }` | `kimi-for-coding`, `kimi-for-coding-highspeed` |
+| `max` | `max` | `{ type: "enabled" }` | models advertising `max` in `think_efforts.valid_efforts` (k3, k3-256k) |
+| `max` | `"high"` (clamped) | `{ type: "enabled" }` | models whose discovery payload does not advertise `max` (K2.7 generation, anything unlisted) |
 | `xhigh` | `"high"` (clamped) | `{ type: "enabled" }` | any |
+| `off` / `auto` / unset | *(omitted)* | `{ type: "enabled" }` | `supports_thinking_type: "only"` models (all current Kimi Code models) |
 
 </details>
 

@@ -238,7 +238,7 @@ async function warmDiscovery(models: unknown[]) {
 }
 
 test("chat.params: k3 keeps max reasoning effort unclamped", async () => {
-  const hooks = await warmDiscovery([{ id: "k3", display_name: "Kimi K3", context_length: 1048576 }])
+  const hooks = await warmDiscovery([{ id: "k3", display_name: "Kimi K3", context_length: 1048576, think_efforts: { valid_efforts: ["low", "high", "max"] } }])
   const { output } = await callParams(
     hooks["chat.params"]!,
     { modelID: "k3", modelOptions: { reasoning_effort: "max" } },
@@ -249,7 +249,7 @@ test("chat.params: k3 keeps max reasoning effort unclamped", async () => {
 })
 
 test("chat.params: k3 clamps xhigh to high", async () => {
-  const hooks = await warmDiscovery([{ id: "k3", display_name: "Kimi K3", context_length: 1048576 }])
+  const hooks = await warmDiscovery([{ id: "k3", display_name: "Kimi K3", context_length: 1048576, think_efforts: { valid_efforts: ["low", "high", "max"] } }])
   const { output } = await callParams(
     hooks["chat.params"]!,
     { modelID: "k3", modelOptions: { reasoning_effort: "xhigh" } },
@@ -399,13 +399,93 @@ test("chat.params: a fallback-id model drops out of the gate once discovery succ
   expect(output.options.thinking).toBeUndefined()
 })
 
+test("chat.params: honors supports_reasoning=false from discovery", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152, supports_reasoning: false }],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  // Runtime entry: no reasoning capability, no effort variants.
+  const k4 = next["Kimi K4"] as any
+  expect(k4.capabilities.reasoning).toBe(false)
+  expect(k4.variants).toEqual({})
+  // Chat hooks: cache hint stays, reasoning fields never attach.
+  const { output } = await callParams(
+    hooks["chat.params"]!,
+    { modelID: "Kimi K4", modelOptions: { reasoning_effort: "high" } },
+    { reasoning_effort: "high" },
+  )
+  expect(output.options.prompt_cache_key).toBe("sess-1")
+  expect(output.options.reasoning_effort).toBeUndefined()
+  expect(output.options.thinking).toBeUndefined()
+})
+
+test("discovery sync: an authoritative empty response overwrites the on-disk cache", async () => {
+  await withTempAuthStore(validAuth(), async (root) => {
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) {
+        return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+      }
+      return { body: { ok: true } }
+    })
+    const first = await getHooks()
+    await first.hooks.config!({} as any)
+    // Entitlement revoked → server now returns an empty list.
+    mock.restore()
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) return { body: { data: [] } }
+      return { body: { ok: true } }
+    })
+    const second = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await second.hooks.config!(config as any)
+    // Memory AND disk must reflect the authoritative empty list; otherwise a
+    // restart would resurrect removed models.
+    expect(config.provider?.[PROVIDER_ID]).toBeUndefined()
+    await expect(fs.readFile(discoveryCachePath(root), "utf8")).resolves.toContain('"models": []')
+  })
+})
+
+test("config: startup queries the server even when a last-known-good cache exists", async () => {
+  await withTempAuthStore(validAuth(), async (root) => {
+    await fs.mkdir(path.dirname(discoveryCachePath(root)), { recursive: true })
+    await fs.writeFile(
+      discoveryCachePath(root),
+      JSON.stringify({ version: 1, updatedAt: new Date().toISOString(), models: [{ id: "stale-model", display_name: "Stale Model", context_length: 1024 }] }),
+      "utf8",
+    )
+    mock = installFetchMock((call) => {
+      if (call.url.endsWith("/coding/v1/models")) {
+        return { body: { data: [{ id: "k4", display_name: "Kimi K4", context_length: 2097152 }] } }
+      }
+      return { body: { ok: true } }
+    })
+    const { hooks } = await getHooks()
+    const config: { provider?: Record<string, any> } = {}
+    await hooks.config!(config as any)
+    // SERVER-FIRST: the live response wins over the seeded cache...
+    expect(mock.calls.some((c) => c.url.endsWith("/coding/v1/models"))).toBe(true)
+    expect(Object.keys(config.provider![PROVIDER_ID]!.models)).toEqual(["Kimi K4"])
+    // ...and the refreshed list replaces the cached one on disk.
+    await expect(fs.readFile(discoveryCachePath(root), "utf8")).resolves.toContain("Kimi K4")
+  })
+})
+
 test("chat.params: the picker name is a valid reference and capability checks resolve to the server id", async () => {
   mock = installFetchMock((call) => {
     if (call.url.endsWith("/coding/v1/models")) {
       return {
         body: {
           data: [
-            { id: "k3", display_name: "Kimi K3", context_length: 1048576 },
+            { id: "k3", display_name: "Kimi K3", context_length: 1048576, think_efforts: { valid_efforts: ["low", "high", "max"] } },
             { id: "k4", display_name: "Kimi K4", context_length: 2097152 },
           ],
         },
@@ -424,9 +504,75 @@ test("chat.params: the picker name is a valid reference and capability checks re
   const lower = await callParams(hooks["chat.params"]!, { modelID: "kimi k4" }, {})
   expect(lower.output.options.prompt_cache_key).toBe("sess-1")
   // ...and `max` survives on "Kimi K3" because the capability check resolved
-  // the key back to the server id "k3" (a member of MAX_REASONING_MODEL_IDS).
+  // the key back to the server id; k3's discovery entry advertises think_efforts including max.
   const k3max = await callParams(hooks["chat.params"]!, { modelID: "Kimi K3", modelOptions: { reasoning_effort: "max" } }, { reasoning_effort: "max" })
   expect(k3max.output.options.reasoning_effort).toBe("max")
+})
+
+test("chat.params: effort tiers come from the server's think_efforts, not a client-side table", async () => {  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [
+            // A model this plugin version has never hardcoded — the server
+            // advertises max, so max passes through.
+            { id: "k3-256k", display_name: "K3-256k", context_length: 262144, think_efforts: { valid_efforts: ["low", "high", "max"] } },
+            // Same generation, no think_efforts advertised → conservative clamp.
+            { id: "kimi-for-coding", display_name: "K2.7 Coding", context_length: 262144 },
+          ],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  const flagship = await callParams(hooks["chat.params"]!, { modelID: "K3-256k", modelOptions: { reasoning_effort: "max" } }, { reasoning_effort: "max" })
+  expect(flagship.output.options.reasoning_effort).toBe("max")
+  const k27 = await callParams(hooks["chat.params"]!, { modelID: "K2.7 Coding", modelOptions: { reasoning_effort: "max" } }, { reasoning_effort: "max" })
+  expect(k27.output.options.reasoning_effort).toBe("high")
+})
+
+test("chat.params: supports_thinking_type='only' models always get thinking enabled", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [
+            {
+              id: "k3",
+              display_name: "K3",
+              context_length: 1048576,
+              supports_thinking_type: "only",
+              think_efforts: { valid_efforts: ["low", "high", "max"] },
+            },
+          ],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+
+  // Forgotten variant → thinking still on (never left implicit).
+  const none = await callParams(hooks["chat.params"]!, { modelID: "K3" }, {})
+  expect(none.output.options.thinking).toEqual({ type: "enabled" })
+  expect(none.output.options.reasoning_effort).toBeUndefined()
+  // `off` is meaningless on a thinking-only model → clamped to enabled.
+  const off = await callParams(hooks["chat.params"]!, { modelID: "K3", modelOptions: { reasoning_effort: "off" } }, { reasoning_effort: "off" })
+  expect(off.output.options.thinking).toEqual({ type: "enabled" })
+  expect(off.output.options.reasoning_effort).toBeUndefined()
+  // `auto` → enabled, server applies its advertised default_effort.
+  const auto = await callParams(hooks["chat.params"]!, { modelID: "K3", modelOptions: { reasoning_effort: "auto" } }, { reasoning_effort: "auto" })
+  expect(auto.output.options.thinking).toEqual({ type: "enabled" })
+  expect(auto.output.options.reasoning_effort).toBeUndefined()
+  // Explicit effort still flows through (with think_efforts clamping).
+  const max = await callParams(hooks["chat.params"]!, { modelID: "K3", modelOptions: { reasoning_effort: "max" } }, { reasoning_effort: "max" })
+  expect(max.output.options.thinking).toEqual({ type: "enabled" })
+  expect(max.output.options.reasoning_effort).toBe("max")
 })
 
 // ---------- WYSIWYG wire rewrite ---------------------------------------------

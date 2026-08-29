@@ -36,12 +36,6 @@ export const MODEL_ID = "kimi-for-coding"
 export const DEFAULT_CONTEXT_LENGTH = 256_000
 export const DEFAULT_OUTPUT_LIMIT = 65_536
 
-// Models that support the `max` reasoning effort tier. This is a server-side
-// capability gate, NOT a model list: K2.7 models clamp max/xhigh to `high` to
-// match kimi-cli behavior, and models unknown to this list clamp as well
-// (safe default — an unsupported effort value fails the request upstream).
-export const MAX_REASONING_MODEL_IDS = ["k3"] as const
-
 // Provider id the user must use in their opencode config. Intentionally NOT
 // "kimi-for-coding" — models.dev publishes an entry under that id (static
 // KIMI_API_KEY flow via a different SDK / auth shape), and sharing the id

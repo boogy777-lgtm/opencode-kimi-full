@@ -6,7 +6,6 @@ import {
   API_BASE_URL,
   DEFAULT_CONTEXT_LENGTH,
   DEFAULT_OUTPUT_LIMIT,
-  MAX_REASONING_MODEL_IDS,
   MODEL_ID,
   PROVIDER_ID,
 } from "./constants.ts"
@@ -146,13 +145,18 @@ function findDiscovered(
 }
 
 
-// kimi-cli clamps xhigh to "high" for all current Kimi Code models and also
-// clamps max to "high" for K2.7 models. K3 (model id "k3") keeps max as-is
-// because Kimi's backend supports it for the flagship model.
-function clampEffort(effort: string, serverModelId: string): string {
+// Effort tiers are server-driven: `think_efforts.valid_efforts` in the
+// discovery payload is the authoritative capability statement (kimi-cli
+// predates this field and clamps max→high for K2.7; models that carry the
+// field — e.g. k3, k3-256k — advertise `max` explicitly). When the server
+// says nothing, clamp conservatively: an unsupported effort value fails the
+// request upstream, so a silent downgrade is the only safe default.
+function clampEffort(effort: string, info: KimiModelInfo | undefined): string {
   if (effort === "xhigh") return "high"
-  if (effort === "max" && !(MAX_REASONING_MODEL_IDS as readonly string[]).includes(serverModelId)) return "high"
-  return effort
+  if (effort !== "max") return effort
+  const valid = info?.think_efforts?.valid_efforts
+  if (valid?.includes("max")) return "max"
+  return "high"
 }
 
 // The catalog the chat hooks gate on: the server-discovered list once
@@ -177,11 +181,27 @@ function resolveKimiBodyFields(
     : undefined
 
   const fields: KimiBodyFields = { prompt_cache_key: input.sessionID }
+  // A model the server marked non-reasoning must not receive thinking or
+  // reasoning_effort — upstream rejects them (kimi-cli gates its "thinking"
+  // capability on the same supports_reasoning flag). prompt_cache_key stays:
+  // it is a cache hint, not a reasoning control.
+  if (info?.supports_reasoning === false) return fields
   const thinking = asThinking(variantOptions?.thinking) ?? asThinking(modelOptions?.thinking)
   const rawEffort = pickEffort(variantOptions) ?? pickEffort(modelOptions)
-  // Capability checks always use the SERVER id ("k3"), never the user-facing
-  // display key, so clamping stays correct no matter how the model was named.
-  const effort = rawEffort ? clampEffort(rawEffort, info?.id ?? input.model.id) : undefined
+  // Capability checks use the discovery entry itself (server-advertised
+  // tiers), never the user-facing key or a client-side model table.
+  const effort = rawEffort ? clampEffort(rawEffort, info) : undefined
+
+  // supports_thinking_type: "only" — thinking is mandatory for these models
+  // (all current Kimi Code models advertise it). Never send "disabled", and
+  // never leave thinking implicit: a user who forgets to pick a variant (or
+  // picks off/auto) still gets thinking enabled; the server applies its
+  // advertised default_effort.
+  if (info?.supports_thinking_type === "only") {
+    fields.thinking = { type: "enabled" }
+    if (effort && effort !== "off" && effort !== "auto") fields.reasoning_effort = effort
+    return fields
+  }
 
   if (effort === "auto") return fields
   if (effort === "off") {
@@ -367,6 +387,9 @@ function effortVariants(): Record<string, Record<string, unknown>> {
 function buildRuntimeModel(discovered: KimiModelInfo): Record<string, unknown> {
   const supportsImageIn = discovered.supports_image_in ?? true
   const supportsVideoIn = discovered.supports_video_in ?? false
+  // kimi-cli derives its "thinking" capability from this exact flag
+  // (platforms.py ModelInfo.capabilities) — mirror it.
+  const supportsReasoning = discovered.supports_reasoning ?? true
   return {
     api: { id: discovered.id, url: API_BASE_URL, npm: "@ai-sdk/openai-compatible" },
     name: discovered.display_name ?? prettifyModelId(discovered.id),
@@ -377,7 +400,7 @@ function buildRuntimeModel(discovered: KimiModelInfo): Record<string, unknown> {
     limit: { context: contextLengthFor(discovered), output: DEFAULT_OUTPUT_LIMIT },
     capabilities: {
       temperature: false,
-      reasoning: true,
+      reasoning: supportsReasoning,
       attachment: supportsImageIn,
       toolcall: true,
       input: { text: true, audio: false, image: supportsImageIn, video: supportsVideoIn, pdf: false },
@@ -385,7 +408,7 @@ function buildRuntimeModel(discovered: KimiModelInfo): Record<string, unknown> {
       interleaved: false,
     },
     release_date: "",
-    variants: effortVariants(),
+    variants: supportsReasoning ? effortVariants() : {},
   }
 }
 
@@ -426,13 +449,14 @@ function buildModelConfig(
   contextLength: number,
   supportsImageIn: boolean,
   supportsVideoIn: boolean,
+  supportsReasoning = true,
 ): Record<string, unknown> {
   const modelConfig: Record<string, unknown> = {
     name,
-    reasoning: true,
+    reasoning: supportsReasoning,
     limit: { context: contextLength, output: DEFAULT_OUTPUT_LIMIT },
     options: {},
-    variants: effortVariants(),
+    variants: supportsReasoning ? effortVariants() : {},
   }
   if (supportsImageIn) {
     // opencode's provider transform gates image parts on model metadata
@@ -449,14 +473,16 @@ function buildModelConfig(
   return modelConfig
 }
 
-function configModelEntry(model: { id: string; display_name?: string; context_length?: number; supports_image_in?: boolean; supports_video_in?: boolean }) {
+function configModelEntry(model: { id: string; display_name?: string; context_length?: number; supports_image_in?: boolean; supports_video_in?: boolean; supports_reasoning?: boolean }) {
   // Fall back to image=true because all current Kimi Code models support
-  // image input; video only when the server explicitly says so.
+  // image input; video only when the server explicitly says so. Reasoning
+  // follows the server's supports_reasoning flag (kimi-cli parity).
   const entry = buildModelConfig(
     model.display_name ?? prettifyModelId(model.id),
     contextLengthFor(model),
     model.supports_image_in ?? true,
     model.supports_video_in ?? false,
+    model.supports_reasoning ?? true,
   )
   return {
     // The server slug that must travel on the wire. opencode resolves wire
@@ -668,16 +694,12 @@ const plugin: Plugin = async ({ client }) => {
   const rememberDiscovery = async (models: KimiModelInfo[]): Promise<ModelDiscovery> => {
     // Always overwrite, even with an empty list: a successful `/models`
     // response is authoritative (kimi-cli removes gone models), so stale
-    // entries must not survive it. Errors never reach this call — callers
-    // keep their previous cache on failure.
+    // entries must not survive it — in memory OR on disk, or a restart would
+    // resurrect removed models. Errors never reach this call.
     cachedDiscovery = { models }
-    if (models.length) {
-      // Awaited (not fire-and-forget) so restarts immediately after startup
-      // still observe the persisted list. Local-file write, sub-millisecond.
-      try {
-        await writeDiscoveryCache(models)
-      } catch {}
-    }
+    try {
+      await writeDiscoveryCache(models)
+    } catch {}
     return cachedDiscovery
   }
 
@@ -736,39 +758,34 @@ const plugin: Plugin = async ({ client }) => {
      */
     config: async (input) => {
       try {
-        let models = cachedDiscovery.models
-        if (!models?.length) {
-          const auth = await readLiveAuth()
-          if (auth) {
-            models = await (async () => {
-              try {
-                const fresh = isAuthExpiring(auth) ? await refreshAuth(auth) : auth
-                try {
-                  return (await rememberDiscovery(await listModels(fresh.access))).models
-                } catch (error) {
-                  if ((error as { status?: number }).status !== 401) {
-                    warnDiscoveryFailure(error)
-                    return undefined
-                  }
-                  try {
-                    return (await rememberDiscovery(await listModels((await refreshAuth(fresh, true)).access))).models
-                  } catch (retryError) {
-                    warnDiscoveryFailure(retryError)
-                    return undefined
-                  }
-                }
-              } catch (error) {
+        // SERVER-FIRST, always: the live query runs on every startup whenever
+        // a token exists — the last-known-good cache is only consulted when
+        // that query fails. Seeding from the cache must never short-circuit
+        // discovery, or newly released models would stay invisible until a
+        // token refresh happened to fire.
+        let models: KimiModelInfo[] | undefined
+        const auth = await readLiveAuth()
+        if (auth) {
+          try {
+            const fresh = isAuthExpiring(auth) ? await refreshAuth(auth) : auth
+            try {
+              models = (await rememberDiscovery(await listModels(fresh.access))).models
+            } catch (error) {
+              if ((error as { status?: number }).status !== 401) {
                 warnDiscoveryFailure(error)
-                return undefined
+              } else {
+                try {
+                  models = (await rememberDiscovery(await listModels((await refreshAuth(fresh, true)).access))).models
+                } catch (retryError) {
+                  warnDiscoveryFailure(retryError)
+                }
               }
-            })()
+            }
+          } catch (error) {
+            warnDiscoveryFailure(error)
           }
         }
-        // No list from the server and no cache (fresh install offline, not
-        // logged in, or a lapsed membership with nothing cached): inject
-        // NOTHING rather than inventing entries — same contract as opencode
-        // core's gitlab discoverModels, which returns {} on failure. A
-        // user-written provider block still stands untouched.
+        if (!models?.length) models = cachedDiscovery.models
         if (models?.length) upsertProviderConfig(input, models)
 
         // ...but never leave a dangling reference: anything in the runtime
