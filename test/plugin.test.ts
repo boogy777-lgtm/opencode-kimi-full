@@ -908,6 +908,8 @@ function makeProviderState(context = 0) {
         },
         variants: {
           auto: { reasoning_effort: "auto" },
+          "low-temp": { temperature: 0.2, reasoning_effort: "low" },
+          "temp-only": { temperature: 0.9 },
         },
       },
       "some-other-model": {
@@ -951,7 +953,11 @@ test("provider.models: existing entries honor supports_reasoning=false from disc
   const provider = makeProviderState()
   const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
   expect(next[MODEL_ID]!.capabilities.reasoning).toBe(false)
-  expect(next[MODEL_ID]!.variants).toEqual({})
+  // Reasoning-only variants are dropped; non-reasoning options survive.
+  expect(next[MODEL_ID]!.variants).toEqual({
+    "low-temp": { temperature: 0.2 },
+    "temp-only": { temperature: 0.9 },
+  })
   // Unrelated entries and the caller's state stay untouched.
   expect(next["some-other-model"]!.capabilities!.reasoning).toBe(false)
   expect(provider.models[MODEL_ID]!.capabilities.reasoning).toBe(true)

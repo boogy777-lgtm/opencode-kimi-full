@@ -271,22 +271,36 @@ function withDiscoveredDisplayName<T extends ModelWithDiscoveryMetadata>(model: 
   }
 }
 
+const REASONING_VARIANT_KEYS = new Set(["reasoning_effort", "reasoningEffort", "thinking"])
+
 function withDiscoveredReasoning<T extends ModelWithDiscoveryMetadata>(model: T, supportsReasoning: boolean | undefined): T {
   // The server is authoritative about a NEGATIVE capability: a runtime entry
   // that keeps advertising reasoning (capabilities.reasoning + effort
   // variants in the picker) for a model the server calls non-reasoning
   // misleads the UI, even though the request gate strips thinking fields.
-  // A positive or absent flag never overrides the user: their variants and
-  // capability stay as configured.
+  // Only reasoning-specific variant keys are stripped — user variants with
+  // other options (e.g. temperature) survive. A positive or absent flag
+  // never overrides the user.
   if (supportsReasoning !== false) return model
   const hasReasoning = model.capabilities?.reasoning === true || model.reasoning === true
-  const hasVariants = Object.keys(model.variants ?? {}).length > 0
-  if (!hasReasoning && !hasVariants) return model
+  const variants = model.variants ?? {}
+  const kept: Record<string, Record<string, unknown>> = {}
+  let variantsChanged = false
+  for (const [name, options] of Object.entries(variants)) {
+    const filtered = Object.fromEntries(Object.entries(options ?? {}).filter(([key]) => !REASONING_VARIANT_KEYS.has(key)))
+    if (Object.keys(filtered).length === 0) {
+      if (Object.keys(options ?? {}).length > 0) variantsChanged = true
+      continue
+    }
+    if (Object.keys(filtered).length !== Object.keys(options ?? {}).length) variantsChanged = true
+    kept[name] = filtered
+  }
+  if (!hasReasoning && !variantsChanged) return model
   return {
     ...model,
     ...(model.reasoning !== undefined ? { reasoning: false } : {}),
     capabilities: { ...model.capabilities, reasoning: false },
-    variants: {},
+    variants: kept,
   }
 }
 
