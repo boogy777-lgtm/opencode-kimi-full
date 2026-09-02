@@ -940,6 +940,38 @@ function makeProviderState(context = 0) {
 
 // ---------- provider.models -------------------------------------------------
 
+test("provider.models: existing entries honor supports_reasoning=false from discovery", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return { body: { data: [{ id: MODEL_ID, context_length: 262144, supports_reasoning: false }] } }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  expect(next[MODEL_ID]!.capabilities.reasoning).toBe(false)
+  expect(next[MODEL_ID]!.variants).toEqual({})
+  // Unrelated entries and the caller's state stay untouched.
+  expect(next["some-other-model"]!.capabilities!.reasoning).toBe(false)
+  expect(provider.models[MODEL_ID]!.capabilities.reasoning).toBe(true)
+  expect(provider.models[MODEL_ID]!.variants.auto).toEqual({ reasoning_effort: "auto" })
+})
+
+test("provider.models: a positive supports_reasoning flag never overrides user variants", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return { body: { data: [{ id: MODEL_ID, context_length: 262144, supports_reasoning: true }] } }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  expect(next[MODEL_ID]!.capabilities.reasoning).toBe(true)
+  expect(next[MODEL_ID]!.variants!.auto).toEqual({ reasoning_effort: "auto" })
+})
+
 test("provider.models: fills limit.context from discovery when config still has zero", async () => {
   mock = installFetchMock((call) => {
     if (call.url.endsWith("/coding/v1/models")) {
