@@ -534,6 +534,56 @@ test("chat.params: effort tiers come from the server's think_efforts, not a clie
   expect(k27.output.options.reasoning_effort).toBe("high")
 })
 
+test("chat.params: an effort the server does not advertise is omitted, not sent to fail upstream", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [
+            // Live k3 advertises low/high/max — medium is NOT a valid tier.
+            { id: "k3", display_name: "K3", context_length: 1048576, think_efforts: { valid_efforts: ["low", "high", "max"] } },
+          ],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  // A tier the discovery entry does not advertise must not reach the wire;
+  // the server applies its advertised default_effort instead.
+  const medium = await callParams(hooks["chat.params"]!, { modelID: "K3", modelOptions: { reasoning_effort: "medium" } }, { reasoning_effort: "medium" })
+  expect(medium.output.options.reasoning_effort).toBeUndefined()
+  expect(medium.output.options.thinking).toEqual({ type: "enabled" })
+  // Advertised tiers pass through untouched.
+  const low = await callParams(hooks["chat.params"]!, { modelID: "K3", modelOptions: { reasoning_effort: "low" } }, { reasoning_effort: "low" })
+  expect(low.output.options.reasoning_effort).toBe("low")
+})
+
+test("provider.models: the picker tier ladder derives from think_efforts.valid_efforts", async () => {
+  mock = installFetchMock((call) => {
+    if (call.url.endsWith("/coding/v1/models")) {
+      return {
+        body: {
+          data: [
+            { id: "k3", display_name: "K3", context_length: 1048576, think_efforts: { valid_efforts: ["low", "high", "max"] } },
+            { id: "legacy", display_name: "Legacy", context_length: 262144 },
+          ],
+        },
+      }
+    }
+    return { body: { ok: true } }
+  })
+  const { hooks } = await getHooks()
+  const provider = makeProviderState()
+  const next = await hooks.provider!.models!(provider as any, { auth: validAuth() } as any)
+  // Server-enumerated tiers only — no medium (k3 rejects it upstream).
+  expect(Object.keys(next["K3"]!.variants ?? {}).sort()).toEqual(["auto", "high", "low", "max", "off"])
+  // A model that says nothing keeps the static ladder.
+  expect(Object.keys(next["Legacy"]!.variants ?? {}).sort()).toEqual(["auto", "high", "low", "max", "medium", "off"])
+})
+
 test("chat.params: supports_thinking_type='only' models always get thinking enabled", async () => {
   mock = installFetchMock((call) => {
     if (call.url.endsWith("/coding/v1/models")) {

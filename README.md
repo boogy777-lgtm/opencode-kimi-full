@@ -271,7 +271,10 @@ Effort-to-field mapping used by the plugin:
 | `max` | `max` | `{ type: "enabled" }` | models advertising `max` in `think_efforts.valid_efforts` (k3, k3-256k) |
 | `max` | `"high"` (clamped) | `{ type: "enabled" }` | models whose discovery payload does not advertise `max` (K2.7 generation, anything unlisted) |
 | `xhigh` | `"high"` (clamped) | `{ type: "enabled" }` | any |
+| tier not advertised (e.g. `medium` on k3) | *(omitted — server applies its `default_effort`)* | `{ type: "enabled" }` | models enumerating `think_efforts.valid_efforts` |
 | `off` / `auto` / unset | *(omitted)* | `{ type: "enabled" }` | `supports_thinking_type: "only"` models (all current Kimi Code models) |
+
+The picker tier ladder itself is server-driven: when a model enumerates `think_efforts.valid_efforts`, only those tiers (plus `off`/`auto`) are offered as variants — so the picker never advertises a tier the server would reject (k3 has no `medium`).
 
 </details>
 

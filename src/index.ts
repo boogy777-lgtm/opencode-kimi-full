@@ -154,12 +154,16 @@ function findDiscovered(
 // field — e.g. k3, k3-256k — advertise `max` explicitly). When the server
 // says nothing, clamp conservatively: an unsupported effort value fails the
 // request upstream, so a silent downgrade is the only safe default.
-function clampEffort(effort: string, info: KimiModelInfo | undefined): string {
-  if (effort === "xhigh") return "high"
-  if (effort !== "max") return effort
+function clampEffort(effort: string, info: KimiModelInfo | undefined): string | undefined {
+  let result = effort
+  if (result === "xhigh") result = "high"
+  if (result === "max" && !info?.think_efforts?.valid_efforts?.includes("max")) result = "high"
+  // When the server enumerates its tiers they are authoritative: an effort it
+  // did not advertise would fail the request upstream, so it is omitted and
+  // the server applies its advertised default_effort instead.
   const valid = info?.think_efforts?.valid_efforts
-  if (valid?.includes("max")) return "max"
-  return "high"
+  if (valid?.length && result !== "auto" && result !== "off" && !valid.includes(result)) return undefined
+  return result
 }
 
 // The catalog the chat hooks gate on: the server-discovered list once
@@ -405,15 +409,20 @@ function contextLengthFor(model: { id: string; context_length?: number }): numbe
   return DEFAULT_CONTEXT_LENGTH
 }
 
-function effortVariants(): Record<string, Record<string, unknown>> {
-  return {
+function effortVariants(info?: Pick<KimiModelInfo, "think_efforts">): Record<string, Record<string, unknown>> {
+  const variants: Record<string, Record<string, unknown>> = {
     off: { reasoning_effort: "off" },
     auto: { reasoning_effort: "auto" },
-    low: { reasoning_effort: "low" },
-    medium: { reasoning_effort: "medium" },
-    high: { reasoning_effort: "high" },
-    max: { reasoning_effort: "max" },
   }
+  // The picker's tier ladder is server-driven when the model enumerates its
+  // efforts (a static ladder would offer tiers the server rejects — k3, for
+  // example, advertises low/high/max and no medium). The static ladder stays
+  // only for models that say nothing.
+  const tiers = info?.think_efforts?.valid_efforts?.length ? info.think_efforts.valid_efforts : ["low", "medium", "high", "max"]
+  for (const tier of tiers) {
+    variants[tier] ??= { reasoning_effort: tier }
+  }
+  return variants
 }
 
 // Full runtime model entry for a server-discovered model that is missing from
@@ -444,7 +453,7 @@ function buildRuntimeModel(discovered: KimiModelInfo): Record<string, unknown> {
       interleaved: false,
     },
     release_date: "",
-    variants: supportsReasoning ? effortVariants() : {},
+    variants: supportsReasoning ? effortVariants(discovered) : {},
   }
 }
 
@@ -489,13 +498,14 @@ function buildModelConfig(
   supportsImageIn: boolean,
   supportsVideoIn: boolean,
   supportsReasoning = true,
+  effortInfo?: Pick<KimiModelInfo, "think_efforts">,
 ): Record<string, unknown> {
   const modelConfig: Record<string, unknown> = {
     name,
     reasoning: supportsReasoning,
     limit: { context: contextLength, output: DEFAULT_OUTPUT_LIMIT },
     options: {},
-    variants: supportsReasoning ? effortVariants() : {},
+    variants: supportsReasoning ? effortVariants(effortInfo) : {},
   }
   if (supportsImageIn) {
     // opencode's provider transform gates image parts on model metadata
@@ -512,7 +522,7 @@ function buildModelConfig(
   return modelConfig
 }
 
-function configModelEntry(model: { id: string; display_name?: string; context_length?: number; supports_image_in?: boolean; supports_video_in?: boolean; supports_reasoning?: boolean }) {
+function configModelEntry(model: { id: string; display_name?: string; context_length?: number; supports_image_in?: boolean; supports_video_in?: boolean; supports_reasoning?: boolean; think_efforts?: KimiModelInfo["think_efforts"] }) {
   // Fall back to image=true because all current Kimi Code models support
   // image input; video only when the server explicitly says so. Reasoning
   // follows the server's supports_reasoning flag (kimi-cli parity).
@@ -522,6 +532,7 @@ function configModelEntry(model: { id: string; display_name?: string; context_le
     model.supports_image_in ?? true,
     model.supports_video_in ?? false,
     model.supports_reasoning ?? true,
+    model,
   )
   return {
     // The server slug that must travel on the wire. opencode resolves wire
