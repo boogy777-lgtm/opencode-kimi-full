@@ -1,4 +1,5 @@
-import type { Plugin, PluginModule } from "@opencode-ai/plugin"
+import type { Plugin as V1Plugin, PluginModule } from "@opencode-ai/plugin"
+import type { Plugin as V2Plugin } from "@opencode/plugin"
 import { isAuthExpiring, refreshAuthWithLock } from "./auth-refresh.ts"
 import { isOAuthAuth, readAuth, type OAuthAuth } from "./auth-store.ts"
 import { readDiscoveryCache, writeDiscoveryCache } from "./discovery-cache.ts"
@@ -10,6 +11,13 @@ import {
   PROVIDER_ID,
 } from "./constants.ts"
 import { kimiHeaders } from "./headers.ts"
+import {
+  applyKimiBodyFields,
+  hasKimiBodyFields,
+  resolveKimiFields,
+  type KimiBodyFields,
+  type KimiThinking,
+} from "./model-fields.ts"
 import { type KimiModelInfo, listModels, pollDeviceToken, startDeviceAuth } from "./oauth.ts"
 
 // IMPORTANT: this module must have exactly ONE export — the default
@@ -33,14 +41,6 @@ type SingleModelDiscovery = {
   model_display?: string
   supports_image_in?: boolean
   supports_video_in?: boolean
-}
-
-type ThinkingType = "enabled" | "disabled"
-
-type KimiBodyFields = {
-  prompt_cache_key?: string
-  thinking?: { type: ThinkingType }
-  reasoning_effort?: string
 }
 
 type ModelWithDiscoveryMetadata = {
@@ -87,7 +87,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>
 }
 
-function asThinking(value: unknown): KimiBodyFields["thinking"] | undefined {
+function asThinking(value: unknown): KimiThinking | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return
   const type = (value as { type?: unknown }).type
   if (type !== "enabled" && type !== "disabled") return
@@ -148,24 +148,6 @@ function findDiscovered(
 }
 
 
-// Effort tiers are server-driven: `think_efforts.valid_efforts` in the
-// discovery payload is the authoritative capability statement (kimi-cli
-// predates this field and clamps max→high for K2.7; models that carry the
-// field — e.g. k3, k3-256k — advertise `max` explicitly). When the server
-// says nothing, clamp conservatively: an unsupported effort value fails the
-// request upstream, so a silent downgrade is the only safe default.
-function clampEffort(effort: string, info: KimiModelInfo | undefined): string | undefined {
-  let result = effort
-  if (result === "xhigh") result = "high"
-  if (result === "max" && !info?.think_efforts?.valid_efforts?.includes("max")) result = "high"
-  // When the server enumerates its tiers they are authoritative: an effort it
-  // did not advertise would fail the request upstream, so it is omitted and
-  // the server applies its advertised default_effort instead.
-  const valid = info?.think_efforts?.valid_efforts
-  if (valid?.length && result !== "auto" && result !== "off" && !valid.includes(result)) return undefined
-  return result
-}
-
 // The catalog the chat hooks gate on: the server-discovered list once
 // discovery has succeeded in this process (kimi-cli keeps no static list at
 // all — removed/entitled-out models drop out, so their requests fail loud
@@ -187,52 +169,12 @@ function resolveKimiBodyFields(
     ? asRecord(input.model.variants?.[input.message.model.variant])
     : undefined
 
-  const fields: KimiBodyFields = { prompt_cache_key: input.sessionID }
-  // A model the server marked non-reasoning must not receive thinking or
-  // reasoning_effort — upstream rejects them (kimi-cli gates its "thinking"
-  // capability on the same supports_reasoning flag). prompt_cache_key stays:
-  // it is a cache hint, not a reasoning control.
-  if (info?.supports_reasoning === false) return fields
-  const thinking = asThinking(variantOptions?.thinking) ?? asThinking(modelOptions?.thinking)
-  const rawEffort = pickEffort(variantOptions) ?? pickEffort(modelOptions)
-  // Capability checks use the discovery entry itself (server-advertised
-  // tiers), never the user-facing key or a client-side model table.
-  const effort = rawEffort ? clampEffort(rawEffort, info) : undefined
-
-  // supports_thinking_type: "only" — thinking is mandatory for these models
-  // (all current Kimi Code models advertise it). Never send "disabled", and
-  // never leave thinking implicit: a user who forgets to pick a variant (or
-  // picks off/auto) still gets thinking enabled; the server applies its
-  // advertised default_effort.
-  if (info?.supports_thinking_type === "only") {
-    fields.thinking = { type: "enabled" }
-    if (effort && effort !== "off" && effort !== "auto") fields.reasoning_effort = effort
-    return fields
-  }
-
-  if (effort === "auto") return fields
-  if (effort === "off") {
-    fields.thinking = { type: "disabled" }
-    return fields
-  }
-  if (effort) fields.reasoning_effort = effort
-  fields.thinking = thinking ?? { type: "enabled" }
-  return fields
-}
-
-function applyKimiBodyFields(target: Record<string, unknown>, fields: KimiBodyFields) {
-  target.prompt_cache_key = fields.prompt_cache_key
-  if (fields.reasoning_effort) {
-    target.reasoning_effort = fields.reasoning_effort
-  } else {
-    delete target.reasoning_effort
-  }
-  delete target.reasoningEffort
-  if (fields.thinking) {
-    target.thinking = fields.thinking
-    return
-  }
-  delete target.thinking
+  return resolveKimiFields({
+    info,
+    sessionID: input.sessionID,
+    effort: pickEffort(variantOptions) ?? pickEffort(modelOptions),
+    thinking: asThinking(variantOptions?.thinking) ?? asThinking(modelOptions?.thinking),
+  })
 }
 
 function consumeInternalKimiBodyFields(headers: Headers): KimiBodyFields {
@@ -249,10 +191,6 @@ function consumeInternalKimiBodyFields(headers: Headers): KimiBodyFields {
   headers.delete(INTERNAL_REASONING_EFFORT_HEADER)
   headers.delete(INTERNAL_THINKING_TYPE_HEADER)
   return fields
-}
-
-function hasKimiBodyFields(fields: KimiBodyFields) {
-  return Boolean(fields.prompt_cache_key || fields.reasoning_effort || fields.thinking)
 }
 
 function withDiscoveredContext<T extends ModelWithDiscoveryMetadata>(model: T, contextLength: number | undefined): T {
@@ -683,7 +621,7 @@ function upsertProviderConfig(input: { provider?: Record<string, ConfigProviderE
  *                  forward-compat if opencode fixes its current
  *                  openai-compatible providerOptions namespace mismatch.
  */
-const plugin: Plugin = async ({ client }) => {
+const plugin: V1Plugin = async ({ client }) => {
   // --- helpers ---------------------------------------------------------------
 
   let cachedDiscovery: ModelDiscovery = {}
@@ -1136,10 +1074,14 @@ const plugin: Plugin = async ({ client }) => {
   }
 }
 
-// v1 PluginModule format — bypasses getLegacyPlugins entirely.
-// For npm-sourced plugins, id is optional (falls back to package.json name),
-// but we set it explicitly for clarity.
+// Dual entrypoint: V1.18.29+ detects `server` and uses the V1 hooks; OpenCode
+// 2 reads `id` + `setup` and ignores `server`. The V2 implementation is
+// imported lazily so V1 never loads the `@opencode/plugin` package.
 export default {
   id: "opencode-kimi-full",
+  async setup(ctx: V2Plugin.Context): Promise<V2Plugin.Cleanup | void> {
+    const { setup } = await import("./v2.ts")
+    return setup(ctx)
+  },
   server: plugin,
-} satisfies PluginModule
+} satisfies PluginModule & Pick<V2Plugin.Plugin, "id" | "setup">

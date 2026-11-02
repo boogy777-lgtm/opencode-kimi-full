@@ -1,6 +1,6 @@
 {
   "name": "opencode-kimi-full",
-  "version": "1.8.0",
+  "version": "2.0.0",
   "description": "OpenCode plugin that brings the official Kimi OAuth device flow and Kimi-specific coding request fields to opencode, matching upstream kimi-cli.",
   "license": "MIT",
   "repository": {
@@ -20,7 +20,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./server": "./src/index.ts",
-    "./tui": "./src/tui.tsx"
+    "./tui": "./src/tui.tsx",
+    "./rpc": "./src/rpc.ts"
   },
   "files": [
     "src",
@@ -46,11 +47,14 @@
     "opencode": ">=1.4.6"
   },
   "dependencies": {
-    "@opentui/core": "0.1.99",
-    "@opentui/solid": "0.1.99"
+    "@opencode/plugin": "2.2.5",
+    "@opentui/core": "0.8.1",
+    "@opentui/solid": "0.8.1",
+    "solid-js": "1.9.18"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.4.7",
+    "@opencode/theme": "2.2.5",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
   }

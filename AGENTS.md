@@ -35,9 +35,14 @@ Each source file has one job. Do not add new files unless the existing ones genu
 | `src/oauth.ts`     | Device-code start, device-code poll, refresh-token exchange, and `GET /coding/v1/models` discovery. |
 | `src/auth-store.ts`| Read/write opencode's `auth.json` entries for this provider.                    |
 | `src/auth-refresh.ts`| Lock-based token refresh with cross-instance coordination, `ensureFreshStoredAuth` for standalone callers. |
-| `src/index.ts`     | Plugin entry (v1 `PluginModule` format). Wires `config` (startup model sync), `auth` (login + loader), `provider.models` (runtime metadata patching + materializing new models), and the Kimi chat hooks/body rewrite. |
+| `src/index.ts`     | Plugin entry. Exports one default object that satisfies both APIs: V1 `server` (config/auth/provider/chat hooks) and V2 `setup` (lazy import of `v2.ts`). |
+| `src/v2.ts`        | OpenCode 2 server setup: provider/model transforms, integration OAuth method, `http.request` rewrite, retry hook, RPC registration, discovery. |
+| `src/model-fields.ts` | Shared KiMi request-field mapping (`clampEffort`, thinking/effort/prompt-cache-key). V1 hooks and the V2 HTTP hook both call it. |
+| `src/rpc.ts`       | Typed RPC contract (`kimi.usage`) used by the server part and the V2 TUI. |
 | `src/usage.ts`     | Fetch and parse Kimi subscription usage (`/coding/v1/usages`).                 |
-| `src/tui.tsx`      | TUI slash command `/kimi:usage` — renders usage in an opencode dialog.         |
+| `src/tui.tsx`      | Dual TUI entrypoint: V1 `tui` and V2 `setup`, each lazily imported.            |
+| `src/tui-v1.tsx`   | V1 `/kimi:usage` dialog (`@opencode-ai/plugin/tui`).                           |
+| `src/tui-v2.tsx`   | V2 `/kimi:usage` dialog (`@opencode/plugin/tui`, keymap + promise dialogs).    |
 
 Data flow on a chat request:
 
@@ -47,6 +52,15 @@ Data flow on a chat request:
 3. The SDK uses our `fetch` for every HTTP call (models, chat, whatever).
 4. Our `fetch` calls `ensureFresh()` → prefers the live opencode auth-store entry over stale `OPENCODE_AUTH_CONTENT` snapshots → maybe refreshes (sharing one in-flight promise in-process and a lock across plugin instances so they don't race the same refresh token) → lazily discovers `/coding/v1/models` when needed → sets Authorization + the seven `X-Msh-*` headers → on 401 refreshes once and retries.
 5. Separately, opencode runs `chat.headers` and `chat.params`. `chat.headers` computes `thinking`, `reasoning_effort`, and `prompt_cache_key` from `input.model.options` plus the selected `input.message.model.variant`, then passes them to `loader.fetch` via private `x-opencode-kimi-*` headers. `loader.fetch` strips those headers and injects the wire fields into the JSON body. `chat.params` mirrors the same keys into `output.options` only as a forward-compat fallback if opencode later fixes its openai-compatible providerOptions namespace mismatch.
+
+OpenCode 2 data flow:
+
+0. `setup(ctx)` seeds the model catalog from `ctx.storage` (fallback: the V1 file cache), registers a `ctx.provider.transform` that adds the provider plus one `Model.Info` per discovered model (`id` = display key, `modelID` = server slug, variants carry `body.reasoning_effort`), and then refreshes discovery in the background.
+1. `ctx.integration.transform` registers the device-flow OAuth method under `kimi-for-coding-oauth`; `authorize` polls the device code, `refresh` exchanges the refresh token, and OpenCode persists the returned credential.
+2. `ctx.session.hook("http.request")` resolves the active connection credential, sets `Authorization` plus the seven `X-Msh-*` headers, rewrites the JSON body (`model` → server slug, `prompt_cache_key`, `thinking`, `reasoning_effort`), and leaves non-JSON bodies untouched.
+3. `ctx.session.hook("retry")` forces one immediate retry on `401`; the integration refresh callback is the only path that mutates the credential chain.
+4. `credential.updated` / `credential.switched` / `integration.updated` events debounce a discovery refresh and `ctx.provider.reload()`.
+5. The TUI calls the `kimi.usage` RPC; the server resolves the credential and fetches usage, so the TUI never sees a token.
 
 ### Contracts to keep intact
 
@@ -75,10 +89,14 @@ These are the invariants that, if broken, silently route requests onto the wrong
    **Naming contract (v1.6.0):** the config key = the picker label = what users write in agents/json. Keys derive from `display_name` via `keyedModels()` (collision → raw id); the raw server slug travels on the wire via each entry's `id` field — opencode resolves wire ids through `apiID = model.id ?? existingModel?.api.id ?? key` in provider.ts, so display keys never leak upstream. The loader's fetch rewrite (`findDiscovered`) accepts the exact key, the raw id, and case/whitespace variants as a safety net; capability checks (effort clamping) consult the discovery entry's `think_efforts.valid_efforts` — never a client-side model table. Never assume key === server id anywhere new. A model with `supports_thinking_type: "only"` (all current Kimi Code models) ALWAYS gets `thinking: {type:"enabled"}` — `off`/`auto`/unset are clamped to enabled, because the model cannot think-lessly answer and a forgotten variant must not silently degrade reasoning. When the server enumerates `think_efforts.valid_efforts`, the picker ladder is built from exactly those tiers (plus off/auto) and any effort NOT advertised is omitted from the wire — the server then applies its `default_effort` (live example: k3 advertises low/high/max, so `medium` is neither offered nor sent).
 7. **Auth store is opencode's, not kimi-cli's.** We use opencode's auth store for tokens under the `kimi-for-coding-oauth` provider id. Do not read/write `~/.kimi/credentials/kimi-code.json`; that's kimi-cli's file and sharing it across independent apps causes token-race bugs. The plugin may live-read opencode's `auth.json` entry for this provider to bypass stale `OPENCODE_AUTH_CONTENT` workspace snapshots, but writes still go through opencode's auth store (`client.auth.set`). Also note that opencode's SDK auth schema only persists the standard oauth fields, so model discovery metadata cannot be stored there durably.
 8. **Provider id must not collide with any id in the [models.dev](https://models.dev) catalog.** models.dev publishes `kimi-for-coding` as a separate API-key-driven integration. If we registered under that same id, `opencode auth login kimi-for-coding` would surface two methods under one entry and users could silently land on the wrong integration path. We deliberately use `kimi-for-coding-oauth` instead; `MODEL_ID` on the wire stays `kimi-for-coding` (rule 6).
-9. **`src/index.ts` must have exactly one export — the default `PluginModule` object `{ id, server }`.** opencode's plugin loader (`research/opencode/packages/opencode/src/plugin/index.ts`) first tries `readV1Plugin` (detect mode) on the default export. If it finds an object with `server` (and optional `id`), it uses the v1 path directly. The older legacy path (`getLegacyPlugins`) iterates every export and throws `Plugin export is not a function` on any non-callable value — a problem that surfaced on Windows where Bun's standalone-binary dynamic imports can produce module namespace objects with unexpected non-function metadata. The v1 format bypasses `getLegacyPlugins` entirely. Keep constants in `src/constants.ts` and import them in `src/index.ts` rather than re-exporting. `test/exports.test.ts` guards this. The failure mode of a broken export is silent in the CLI (the provider just doesn't appear in `opencode auth login`); the error only surfaces in `~/.local/share/opencode/log/*.log`.
+9. **`src/index.ts` must have exactly one export — the default dual entrypoint.** The default object has `id`, `server` (V1.18.29+ `PluginModule`), and `setup` (OpenCode 2). V2's setup is a lazy `import("./v2.ts")` so V1 never loads `@opencode/plugin`. Keep constants in `src/constants.ts` and import them in `src/index.ts` rather than re-exporting. `test/exports.test.ts` guards the single-export rule and the V1 `server` callable. The failure mode of a broken export is silent in the CLI (the provider just doesn't appear in `opencode auth login`); the error only surfaces in `~/.local/share/opencode/log/*.log`.
 10. **Generated model config entries must carry a complete `limit` object.** opencode's live config schema at `https://opencode.ai/config.json` requires both `limit.context` and `limit.output` whenever `limit` is present. `configModelEntry()`/`buildConfigBlock()` therefore emit `limit.context` from the server-reported `context_length` (falling back to `DEFAULT_CONTEXT_LENGTH` = 256_000 when the server omits it) and a conservative `limit.output` of `65536`. Do not set `limit.input` heuristically; opencode's overflow logic treats `limit.input` as authoritative (`research/opencode/packages/opencode/src/session/overflow.ts`).
 11. **Concurrent refreshes must collapse to one in-flight OAuth exchange, even across plugin instances.** `provider.models` and `auth.loader` can both notice an expiring token at about the same time, and separate opencode workspace/plugin instances can inherit stale auth snapshots. `refreshAuth()` in `src/index.ts` therefore shares one promise across overlapping callers, takes a provider-scoped auth-store lock before refreshing, re-reads opencode's live auth-store entry under that lock, and treats a changed on-disk token chain as authoritative. `test/plugin.test.ts` covers loader-vs-loader, provider.models-vs-loader, cross-instance lock reuse, and the `invalid_grant` self-heal path where another process already rotated the refresh token.
-12. **Media-input capabilities must be backfilled from `/coding/v1/models`.** `supports_image_in` and `supports_video_in` from Kimi discovery are not cosmetic metadata: opencode's provider transform (`research/opencode/packages/opencode/src/provider/transform.ts::unsupportedParts`) rewrites every image part into local `ERROR: Cannot read ... (this model does not support image input)` text before the request reaches our loader when `capabilities.input.image` is false. Therefore the `config` hook generates `attachment: true` plus `modalities` for every injected model, `provider.models` patches runtime metadata for every known Kimi Code model id, and `buildConfigBlock()` includes the same fields when discovery says images/video are supported. `test/plugin.test.ts` covers both paths.
+12. **Media-input capabilities must be backfilled from `/coding/v1/models`.** `supports_image_in` and `supports_video_in` from Kimi discovery are not cosmetic metadata: opencode's provider transform (`research/opencode/packages/opencode/src/provider/transform.ts::unsupportedParts`) rewrites every image part into local `ERROR: Cannot read ... (this model does not support image input)` text before the request reaches our loader when `capabilities.input.image` is false. Therefore the `config` hook generates `attachment: true` plus `modalities` for every injected model, `provider.models` patches runtime metadata for every known Kimi Code model id, and `buildConfigBlock()` includes the same fields when discovery says images/video are supported. `test/plugin.test.ts` covers both paths. In V2 this maps to `Model.Info.capabilities.input` (`text`/`image`/`video`) and `limit`, generated by `buildModel()` in `src/v2.ts`.
+
+13. **OpenCode 2 has one request-rewrite path: `ctx.session.hook("http.request")`.** Do not add a second `aisdk`/fetch wrapper or a `chat.headers` private-header bridge for V2. The HTTP hook sees the final JSON body (after variant `body` overlays), so it can derive `reasoning_effort` from the body, clamp it against the server catalog, and set `thinking`/`prompt_cache_key`. It must mutate headers in place, only rebuild the `Request` when the JSON body changed, and leave non-JSON bodies alone. Credentials come exclusively from `ctx.integration.connection.active/resolve`; the plugin never writes the V2 credential store. The OAuth `refresh` callback is the only place allowed to rotate the refresh token.
+
+14. **V2 model identity is `id` = display key, `modelID` = server slug.** The picker and config references use `id` (the `display_name`), while the wire `model` field uses `modelID` (`k3`, `k3-256k`, ...). `buildModel()` and the `http.request` rewrite both enforce this; do not collapse them into one field.
 
 ### Working on this repo
 
@@ -98,7 +116,7 @@ These are the invariants that, if broken, silently route requests onto the wrong
 - ❌ Don't call out to other files to "share" the kimi-cli credentials. Different OAuth consumers must have independent refresh-token chains or one will invalidate the other.
 - ❌ Don't introduce a build step. The plugin ships as `.ts` and opencode's bun-based loader handles it.
 - ❌ Don't add tests that require real Kimi credentials and check them in. If you add offline unit tests, put them under `test/` and mock `fetch`.
-- ❌ Don't add named exports to `src/index.ts` or change the default export away from the `{ id, server }` PluginModule shape. See rule 9.
+- ❌ Don't add named exports to `src/index.ts` or remove `server`/`setup` from the default object. See rule 9.
 
 ### How to verify a change
 
@@ -113,14 +131,16 @@ bun test                                           # offline unit tests
 
 Online (requires a real Kimi-for-coding account):
 
-1. Install the local checkout via opencode's plugin flow (`opencode plugin /path/to/this/repo --global`) or point the `plugin` array in your opencode config at the repo root, as shown in `README.md`.
-2. No provider block is needed — the `config` hook injects it. Add one only to test override merging.
-3. `opencode auth login kimi-for-coding-oauth` — confirm a token lands in opencode's `auth.json` with `type: "oauth"`, a JWT `access`, and `expires` ~15 min in the future.
-4. Start opencode, select any `kimi-for-coding-oauth/*` model, and ask the model to self-identify. It should claim to be the selected Kimi Code model.
-5. Confirm `reasoning_content` deltas render as thinking content (not assistant text). For `k3`, switch to the `max` variant and confirm the request includes `reasoning_effort: "max"`.
-6. In a second turn of the same session, confirm the response comes back faster (cache hit via `prompt_cache_key`).
+1. Install the local checkout via the plugin flow (`opencode plugin add /path/to/this/repo` on V2, or `opencode plugin /path/to/this/repo --global` on V1), as shown in `README.md`.
+2. No provider block is needed — discovery injects it. Add one only to test override merging.
+3. `opencode auth login kimi-for-coding-oauth` — confirm a credential lands in the host store with `type: "oauth"` and an access token.
+4. Start opencode, run `opencode models | grep kimi-for-coding-oauth`, and select a model.
+5. Ask the model to self-identify. It should claim to be the selected Kimi Code model.
+6. Confirm `reasoning_content` deltas render as thinking content. For `k3`, switch to the `max` variant and confirm the request includes `reasoning_effort: "max"`.
+7. In a second turn of the same session, confirm the response comes back faster (cache hit via `prompt_cache_key`).
+8. On V2, `/kimi:usage` should render through the `kimi.usage` RPC without exposing the token to the TUI.
 
-If any of 3–6 fails, diff `research/kimi-cli` against the contracts above.
+If any of 3–8 fails, diff `research/kimi-cli` against the contracts above. A 403 with `access_terminated_error` means the fingerprint headers regressed; a plain `permission_denied_error` subscription message means the account, not the plugin, lost entitlement.
 
 ### House rules for AI agents
 

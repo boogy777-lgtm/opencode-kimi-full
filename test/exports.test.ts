@@ -20,6 +20,8 @@ test("src/index.ts exports exactly one default PluginModule object", () => {
   expect(plugin).not.toBeNull()
   const obj = plugin as Record<string, unknown>
   expect(typeof obj.server).toBe("function")
+  expect(typeof obj.setup).toBe("function")
+  expect(obj.id).toBe("opencode-kimi-full")
   expect("id" in obj).toBe(true)
 })
 
@@ -28,5 +30,7 @@ test("package exposes a separate TUI entrypoint", () => {
     exports?: Record<string, string>
   }
   expect(pkg.exports?.["./tui"]).toBe("./src/tui.tsx")
+  expect(pkg.exports?.["./rpc"]).toBe("./src/rpc.ts")
   expect(fs.existsSync(new URL("../src/tui.tsx", import.meta.url))).toBe(true)
+  expect(fs.existsSync(new URL("../src/rpc.ts", import.meta.url))).toBe(true)
 })

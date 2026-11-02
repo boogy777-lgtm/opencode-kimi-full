@@ -11,7 +11,8 @@ Compared with stock opencode Kimi setups, this plugin:
 - adds `prompt_cache_key`, `thinking`, and `reasoning_effort` for Kimi Code requests
 - syncs the full model list from `/coding/v1/models` at every startup (server-first; the last-known-good cache only covers failed queries), so newly released Kimi Code models appear in the picker without a plugin update or config edits
 - discovers the authoritative wire model slug, display name, context length, and media-input capabilities from `/coding/v1/models` (`attachment`/`modalities` are omitted when the server reports `supports_image_in: false`)
-- keeps tokens in opencode's auth store while mirroring `kimi-cli`'s refresh / retry behavior
+- keeps tokens in the host's credential store (V1 `auth.json`; OpenCode 2 integration credentials) while mirroring `kimi-cli`'s refresh / retry behavior
+- supports OpenCode 2 plugins through the native `plugins` config, provider/model transforms, integration OAuth, and session HTTP hooks — the same package also keeps the V1 `{ id, server }` entrypoint working
 - provides a `/kimi:usage` TUI command to check subscription usage
 
 Contributor and agent documentation lives in [`AGENTS.md`](./AGENTS.md).
@@ -20,35 +21,52 @@ Contributor and agent documentation lives in [`AGENTS.md`](./AGENTS.md).
 
 ### Quick Start
 
-1. Install the plugin globally: `opencode plugin opencode-kimi-full --global`
-2. If you are testing a local checkout instead of the published package, install the checkout path instead: `opencode plugin /absolute/path/to/opencode-kimi-full --global`
-3. Run `opencode auth login -p kimi-for-coding-oauth` and approve the device flow in your browser.
+1. Install the plugin globally:
+   - OpenCode 2: `opencode plugin add opencode-kimi-full`
+   - V1: `opencode plugin opencode-kimi-full --global`
+2. If you are testing a local checkout instead of the published package, point the config at the absolute directory path (see [Install](#install)).
+3. Run `opencode auth login kimi-for-coding-oauth` and approve the device flow in your browser.
 4. Select any model under `kimi-for-coding-oauth/` in opencode. The provider entry and its model list are injected automatically at startup — no manual config block is required. See [Configure](#configure) only if you want to override something.
 
 ### Requirements
 
-- `opencode` >= 1.4.6
+- `opencode` >= 1.18.29 for V2/V1 dual loading, or OpenCode 2.x
 - A Kimi account with an active **Kimi For Coding** subscription (the same plan that works with kimi-cli)
 
 ### Install
 
-Recommended:
+OpenCode 2:
+
+```sh
+opencode plugin add opencode-kimi-full
+```
+
+V1:
 
 ```sh
 opencode plugin opencode-kimi-full --global
 ```
 
-That installs the published package and adds the plugin to your global opencode config, so `opencode auth login -p kimi-for-coding-oauth` works from any directory.
+Both commands install the published package and add the plugin to your global config, so `opencode auth login kimi-for-coding-oauth` works from any directory.
 
 From a local checkout:
 
 ```sh
-opencode plugin /absolute/path/to/opencode-kimi-full --global
+opencode plugin add /absolute/path/to/opencode-kimi-full
 ```
 
 That is the command you want when you are editing this repo and want opencode to load your working tree. Changing files in a checkout does nothing unless opencode is pointed at that checkout path.
 
-If you prefer managing plugin registration manually, add the plugin to the `plugin` list in `~/.config/opencode/opencode.json` or a project-local `.opencode/opencode.json`:
+If you prefer managing plugin registration manually, add the plugin to the `plugins` list in `~/.config/opencode/opencode.json` or a project-local `.opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["opencode-kimi-full"]
+}
+```
+
+V1 uses the older key and accepts the same values:
 
 ```json
 {
@@ -57,12 +75,12 @@ If you prefer managing plugin registration manually, add the plugin to the `plug
 }
 ```
 
-For a local checkout, point the `plugin` entry at the repo root instead of the npm package name:
+For a local checkout, point the entry at the repo directory instead of the npm package name:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["/absolute/path/to/opencode-kimi-full"]
+  "plugins": ["/absolute/path/to/opencode-kimi-full"]
 }
 ```
 
@@ -90,7 +108,29 @@ Keys are derived from the server's `display_name`; the raw server slug (`k3`) ri
 
 > **Migrating from v1.5.x:** replace raw-slug references with display names — `kimi-for-coding-oauth/kimi-for-coding` → `kimi-for-coding-oauth/Kimi For Coding`, `kimi-for-coding-oauth/k3` → `kimi-for-coding-oauth/Kimi K3`. Old manual provider blocks can simply be deleted; the plugin injects everything itself.
 
-Add a config block only to **override** generated entries — under the same display-name key. Your keys win per-field; everything else stays generated:
+Add a config block only to **override** generated entries — under the same display-name key. Your keys win per-field; everything else stays generated.
+
+OpenCode 2 uses the native `providers` shape. The generated model entry carries the wire slug in `modelID` and variants as an array:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "kimi-for-coding-oauth": {
+      "models": {
+        "Kimi K3": {
+          "name": "Kimi K3 (mine)",
+          "variants": [
+            { "id": "max", "body": { "reasoning_effort": "max" } }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+V1 uses `provider` and a variants object:
 
 ```json
 {
@@ -110,7 +150,7 @@ Add a config block only to **override** generated entries — under the same dis
 }
 ```
 
-Generated model entries look like this (shown for reference; `context` comes from the server, `output` is a conservative `65536`):
+V1 generated model entries look like this (shown for reference; `context` comes from the server, `output` is a conservative `65536`):
 
 ```json
 {
@@ -137,6 +177,23 @@ Generated model entries look like this (shown for reference; `context` comes fro
 }
 ```
 
+In OpenCode 2 the same entry is expressed with `modelID` and an array of variants:
+
+```json
+{
+  "Kimi K3": {
+    "modelID": "k3",
+    "name": "Kimi K3",
+    "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"], "temperature": false },
+    "limit": { "context": 1048576, "output": 65536 },
+    "variants": [
+      { "id": "off", "body": { "reasoning_effort": "off" } },
+      { "id": "high", "body": { "reasoning_effort": "high" } }
+    ]
+  }
+}
+```
+
 > **Important:** The generated `attachment` and `modalities` fields are what make image input work — opencode strips image parts before they reach Kimi without them. The plugin injects them from the server's `supports_image_in` / `supports_video_in` flags; if you fully replace a model entry in your own config, keep those fields.
 
 The **provider id** `kimi-for-coding-oauth` is fixed -- the plugin's `auth` and chat hooks match on it. **Model keys** come from the server's `display_name`; the plugin rewrites the wire `model` field to the server-reported slug on every request (belt to the `id` field's suspenders), and models the server starts returning appear under their names after the next restart.
@@ -146,7 +203,7 @@ The **provider id** `kimi-for-coding-oauth` is fixed -- the plugin's `auth` and 
 ### Log in
 
 ```sh
-opencode auth login -p kimi-for-coding-oauth
+opencode auth login kimi-for-coding-oauth
 ```
 
 Then complete the device-flow approval in your browser.
@@ -154,9 +211,9 @@ Then complete the device-flow approval in your browser.
 During login the plugin:
 
 - shows a verification URL and user code
-- stores the OAuth token in opencode's auth store
+- stores the OAuth token in the host credential store (V1 `auth.json`, OpenCode 2 integration credentials)
 - discovers the exact model slugs, display names, context lengths, and media-input capabilities your account is entitled to
-- prints the discovered model list; the models themselves are injected into the config automatically at the next startup
+- prints the discovered model list; the models themselves are injected automatically at startup
 
 Access tokens refresh automatically while you use the model.
 
@@ -167,16 +224,16 @@ That error means opencode did not load this plugin at all. The Kimi OAuth flow h
 
 The usual causes are:
 
-- You skipped `opencode plugin opencode-kimi-full --global` or `opencode plugin /absolute/path/to/opencode-kimi-full --global`.
+- You skipped `opencode plugin add opencode-kimi-full` (OpenCode 2) or `opencode plugin opencode-kimi-full --global` (V1).
 - You edited a local checkout, but opencode is not pointed at that checkout path.
 - You put the plugin in a project-local `.opencode/opencode.json`, but ran `opencode auth login` from another directory.
-- You added the `provider` block, but not the `plugin` entry or plugin install.
+- You added the `provider` block, but not the `plugins` entry or plugin install.
 
 Fastest fix:
 
-1. Install the plugin globally with `opencode plugin opencode-kimi-full --global`, or `opencode plugin /absolute/path/to/opencode-kimi-full --global` for a checkout.
+1. Install the plugin globally with `opencode plugin add opencode-kimi-full`, or point the config at the checkout directory.
 2. Confirm your opencode config now contains the plugin entry.
-3. Run `opencode auth login -p kimi-for-coding-oauth` again.
+3. Run `opencode auth login kimi-for-coding-oauth` again.
 
 </details>
 
@@ -195,11 +252,12 @@ The plugin also backfills these capabilities at runtime from `/coding/v1/models`
 <summary><strong>Login and refresh details</strong></summary>
 
 - The plugin queries `/coding/v1/models` at startup, during login, and on every token refresh so it always works with the account's current model entitlement: wire model ids, context lengths, and media capabilities.
-- The startup response feeds the config injection described in [Configure](#configure) — this is how newly released Kimi Code models appear in the picker without a plugin update.
-- The plugin uses the same discovery response to backfill image and video input support into opencode's runtime model metadata, so pasted or dropped images reach Kimi instead of being downgraded into local error text.
-- Generated config entries carry `limit.context` from the server-reported `context_length` (`256_000` default when the server omits it) and a conservative `output` limit of `65536`.
-- On a `401`, the loader refreshes the access token once and retries the request once.
-- Refreshes are coordinated through opencode's live auth store so concurrent workspaces do not keep using an older refresh-token chain from a stale `OPENCODE_AUTH_CONTENT` snapshot.
+- On OpenCode 2 the same discovery feeds `ctx.provider.transform`; discovered models are bound to the active integration connection and reloaded after credential changes.
+- The startup response feeds model injection in both APIs — this is how newly released Kimi Code models appear in the picker without a plugin update.
+- The plugin uses the same discovery response to backfill image and video input support into runtime model metadata, so pasted or dropped images reach Kimi instead of being downgraded into local error text.
+- Generated entries carry `limit.context` from the server-reported `context_length` (`256_000` default when the server omits it) and a conservative `output` limit of `65536`.
+- On a `401`, the V1 loader refreshes the access token once and retries the request once; OpenCode 2 retries through the integration refresh callback and the plugin's `retry` hook.
+- V1 refreshes are coordinated through opencode's live auth store so concurrent workspaces do not keep using an older refresh-token chain from a stale `OPENCODE_AUTH_CONTENT` snapshot. OpenCode 2 persists the credential returned by the integration `refresh` callback.
 
 </details>
 
@@ -244,7 +302,7 @@ Stock opencode can already talk to generic Moonshot and OpenAI-compatible endpoi
 - `~/.kimi/device_id` shared with a locally-installed kimi-cli.
 - Runtime model discovery from `/coding/v1/models`, including the server-reported wire slug, `display_name`, `context_length`, and media-input capabilities.
 - Startup model sync that injects the provider entry and the discovered model list into opencode's config, so new Kimi Code models appear without a plugin update.
-- Tokens stored in opencode's auth store under a dedicated provider id, so the plugin and kimi-cli keep independent refresh-token chains and do not invalidate each other.
+- Tokens stored in the host credential store (V1 `auth.json`, OpenCode 2 integration credentials) under a dedicated provider id, so the plugin and kimi-cli keep independent refresh-token chains and do not invalidate each other.
 - Live auth-store rereads plus a provider-scoped refresh lock, so concurrent opencode workspaces converge on the latest refresh-token chain instead of tripping `invalid_grant`.
 - Streaming, `reasoning_content` deltas, and tool-call schemas are handled upstream by `@ai-sdk/openai-compatible` -- not reimplemented here.
 
@@ -284,7 +342,9 @@ The picker tier ladder itself is server-driven: when a model enumerates `think_e
 | Path | Purpose |
 |---|---|
 | `~/.kimi/device_id` | Stable UUID used in `X-Msh-Device-Id`. Shared with kimi-cli. |
-| opencode auth store (`auth.json` in opencode's XDG data dir; on Linux typically `~/.local/share/opencode/auth.json`) | Token storage, managed by opencode through `client.auth.*`; the plugin also live-reads this entry to avoid stale workspace auth snapshots during refresh. |
+| V1: opencode auth store (`auth.json` in opencode's XDG data dir; on Linux typically `~/.local/share/opencode/auth.json`) | Token storage, managed by opencode through `client.auth.*`; the plugin also live-reads this entry to avoid stale workspace auth snapshots during refresh. |
+| V2: OpenCode credential store | Tokens are stored by OpenCode from the integration OAuth/refresh callbacks; the plugin resolves them through `ctx.integration.connection` and never writes the store directly. |
+| V2: plugin storage (`ctx.storage`) + `kimi-for-coding-oauth.models.json` | Last-known-good model list for cold starts. The plugin keeps the file cache in sync so a V1↔V2 switch stays warm. |
 
 No other state is persisted. Credentials are never written to `~/.kimi/credentials/`; that path belongs to kimi-cli, and sharing it would cause refresh-token races between the two clients.
 
@@ -296,23 +356,33 @@ No other state is persisted. Credentials are never written to `~/.kimi/credentia
 ```
                       opencode core
  ──────────────────────────────────────────────────
-  startup ─────> plugin "config"             /models discovery →
+  V1 startup ───> plugin "config"             /models discovery →
                                                inject provider + model list
 
-  auth.login ──> plugin.auth.authorize()     device-code flow, poll
-                   └──> oauth.ts
+  V1 auth.login─> plugin.auth.authorize()     device-code flow, poll
+                    └──> oauth.ts
 
-  chat ────────> plugin.loader()             custom fetch that:
-                   ├──> ensureFresh()          proactive refresh
-                   └──> kimiHeaders()          7 X-Msh-* headers
-                                               /models slug discovery
-                                               401 -> force-refresh + retry
+  V1 chat ──────> plugin.loader()             custom fetch that:
+                    ├──> ensureFresh()          proactive refresh
+                    └──> kimiHeaders()          7 X-Msh-* headers
+                                                /models slug discovery
+                                                401 -> force-refresh + retry
 
-  chat.params ─> plugin "chat.params"        thinking / reasoning_effort /
-                                              prompt_cache_key
+  V1 chat.params > plugin "chat.params"       thinking / reasoning_effort /
+                                               prompt_cache_key
 
-  /kimi:usage ─> tui.tsx                     subscription usage dialog
-                   └──> usage.ts
+  V2 setup ─────> ctx.provider.transform      provider + discovered models
+                    └──> model definitions      (modelID = server slug)
+
+  V2 auth.login─> ctx.integration.transform   device-code OAuth method
+                    └──> oauth.ts               refresh callback
+
+  V2 chat ──────> ctx.session.hook            http.request:
+                    ("http.request")            X-Msh-* + Authorization
+                                                body rewrite + 401 retry
+
+  /kimi:usage ──> RPC "kimi.usage"            server owns the credential
+                    └──> usage.ts               TUI only renders rows
 ```
 
 A full description of the invariants that keep this working is in [`AGENTS.md`](./AGENTS.md), under "Architecture" and "Contracts to keep intact".
